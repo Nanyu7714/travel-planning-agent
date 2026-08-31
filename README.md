@@ -1,8 +1,12 @@
-# Git
+# 多城市个性化旅游规划平台
 
-这是一个 Git 项目的初始仓库。
+这是一个基于大语言模型的多城市个性化旅游规划平台。
 
-## 说明
+## 项目文档
 
-- 使用 SSH 认证推送到 GitHub
-- 仓库地址: https://github.com/Nanyu7714/Git
+- [开发文档](旅游规划咨询Agent-开发文档.md)
+- [样式设计文档](旅游规划咨询Agent-样式设计文档.md)
+
+## 仓库地址
+
+https://github.com/Nanyu7714/travel-planning-agent
