@@ -42,10 +42,10 @@
 | AI 咨询 | 多轮采集目的地、天数、预算、兴趣和节奏 |
 | 行程规划 | 生成 2～5 天游，安排景点顺序和每日时间 |
 | 约束校验 | 校验开放时间、游玩时长、交通时间和预算 |
-| 行程调整 | 支持增加、删除、替换景点和调整节奏 |
+| 行程调整 | 支持修改天数、预算、偏好、每日时间、景点顺序，增加、删除、替换景点，查看历史版本并恢复 |
 | 行程管理 | 登录用户可以保存、查看和删除自己的行程 |
-| 用户功能 | 收藏城市和景点、查看最近浏览、维护账号设置、生成可撤销的只读行程分享链接 |
-| 后台管理 | 管理城市、景点、标签和排行数据 |
+| 用户功能 | 用户主页维护资料、偏好和排除地点，收藏城市/景点/行程，查看最近浏览，管理登录设备，生成可撤销的只读行程分享链接并提交评分评论 |
+| 后台管理 | 查看城市、景点、用户、会话和反馈模块；城市、景点、标签和排行的完整 CRUD 仍在后续实现 |
 
 ### 2.2 明确不做
 
@@ -215,10 +215,10 @@ Router 不直接写 SQL，Agent 不直接访问数据库，管理员模块不重
 | 我的行程 | `/me/itineraries` | 保存的行程、修订版本和历史记录 |
 | 我的收藏 | `/me/favorites` | 收藏的城市和景点 |
 | 最近浏览 | `/me/recent-views` | 最近查看的城市和景点 |
-| 个人资料 | `/me/settings/profile` | 修改昵称和基础资料 |
+| 个人资料 | `/me/settings/profile` | 查看不可修改的公开用户 ID 和基础资料，注销账号 |
 | 账号安全 | `/me/settings/security` | 修改邮箱、密码，管理登录设备和注销账号 |
 | 公开分享 | `/share/itineraries/:token` | 通过随机令牌只读查看已分享行程 |
-| 登录注册 | `/login`、`/register` | 邮箱账号注册与登录 |
+| 登录注册 | `/login`、`/register` | 用户名、邮箱或 4 位公开用户 ID 登录 |
 | 验证邮箱 | `/verify-email` | 使用一次性令牌激活邮箱 |
 | 找回密码 | `/forgot-password`、`/reset-password` | 申请并完成密码重置 |
 
@@ -247,7 +247,7 @@ MVP 不实现匿名 Agent 会话迁移。游客进入 `/planner`、收藏或“�
 邮箱验证成功，进入登录页
 ```
 
-- 邮箱是唯一登录标识；昵称用于页面展示，不要求唯一，长度为 2～30 个字符。
+- 当前 MVP 使用唯一用户名和唯一邮箱注册，并为每个正常账号分配唯一的 4 位公开用户 ID。4 位纯数字不能作为用户名，避免和公开用户 ID 混淆。
 - 密码长度为 10～128 个字符，允许密码管理器生成的长密码和粘贴操作；不强制特殊字符组合，但拒绝常见弱密码和与邮箱高度相似的密码。
 - “确认密码”只在浏览器中校验，不作为接口字段保存或写入日志。
 - 注册接口无论邮箱是否已存在，都返回不泄露账号状态的通用提示；已存在账号可以收到安全提醒邮件，但接口不能帮助攻击者枚举用户。
@@ -255,7 +255,7 @@ MVP 不实现匿名 Agent 会话迁移。游客进入 `/planner`、收藏或“�
 
 #### 5.1.3 登录与退出流程
 
-登录只接收邮箱和密码。失败时统一显示“邮箱或密码不正确”，不能分别提示邮箱存在或密码错误。连续失败按账号和 IP 双维度限流：建议 15 分钟内失败 5 次后暂停登录 15 分钟；成功登录后清除失败计数。重复失败时可以增加验证码，但验证码不是替代限流的安全措施。
+登录接收用户名、邮箱或 4 位公开用户 ID，并统一与密码校验。失败时显示“账号或密码错误”，不能分别提示账号存在或密码错误。连续失败按账号和 IP 双维度限流：建议 15 分钟内失败 5 次后暂停登录 15 分钟；成功登录后清除失败计数。重复失败时可以增加验证码，但验证码不是替代限流的安全措施。
 
 登录成功后：
 
@@ -309,12 +309,14 @@ MVP 不实现匿名 Agent 会话迁移。游客进入 `/planner`、收藏或“�
 
 ### 6.0 用户与登录会话 `users`、`auth_sessions`
 
-`users` 保存账号、密码哈希和角色，不保存明文密码；`auth_sessions` 保存 Refresh Token 哈希、过期时间和撤销时间，支持退出登录和 Token 轮换。
+`users` 保存账号、密码哈希和角色，不保存明文密码；`auth_sessions` 保存 Refresh Token 哈希、过期时间和撤销时间，支持退出登录和 Token 轮换。数据库自增主键 `users.id` 是账号和所有私有数据的唯一归属依据；`public_id` 只是面向用户展示和登录的 4 位编号，不能作为外键、权限判断依据或 Token 的用户标识。
 
 ```json
 {
   "users": {
-    "id": "uuid",
+    "id": "integer, auto increment",
+    "public_id": "4 digit string | null",
+    "username": "string",
     "email": "string",
     "display_name": "string",
     "password_hash": "string",
@@ -331,7 +333,7 @@ MVP 不实现匿名 Agent 会话迁移。游客进入 `/planner`、收藏或“�
   },
   "auth_sessions": {
     "id": "uuid",
-    "user_id": "uuid",
+    "user_id": "integer",
     "token_family_id": "uuid",
     "refresh_token_hash": "string",
     "csrf_token_hash": "string",
@@ -345,6 +347,14 @@ MVP 不实现匿名 Agent 会话迁移。游客进入 `/planner`、收藏或“�
   }
 }
 ```
+
+公开用户 ID 的生命周期规则：
+
+- 正常账号必须持有一个 `0000`～`9999` 范围内的唯一公开 ID，个人资料页只读展示，不允许用户修改。
+- 分配时由服务端随机选择起点并检查唯一索引；并发注册发生冲突时重新分配。系统最多同时分配 10,000 个公开 ID，达到上限时停止注册并返回明确错误。
+- 用户注销账号时撤销该内部用户主键下的全部认证会话，清除认证 Cookie，将账号标记为不可登录，并把 `public_id` 置空以释放编号。
+- 释放后的编号允许分配给新账号，但新账号拥有不同的内部自增主键，因此不能读取原账号的会话、消息、行程或其他私人数据。Access Token 的 `sub` 和 Refresh Token 会话始终绑定内部主键。
+- 注销后原业务数据按后台数据保留策略继续保存，后续永久清理或匿名化只能按内部主键执行，不能按可能复用的公开 ID 执行。
 
 邮箱在写入前去除首尾空格并按小写规范化，数据库对规范化邮箱建立唯一索引。首个管理员账号通过一次性部署脚本创建，普通注册接口永远只能创建 `user` 角色；角色变更只能由已有管理员执行并写入审计日志。
 
@@ -1309,10 +1319,21 @@ Idempotency-Key: <uuid>
 {
   "confirmed": true,
   "patch": {
-    "budget_total": 3000
+    "destination_city_id": 3,
+    "days": 4,
+    "traveler_count": 2,
+    "budget_total": 3000,
+    "interests": ["美食", "摄影"],
+    "avoid_places": ["过度拥挤"],
+    "pace": "relaxed",
+    "transport": "public_transport"
   }
 }
 ```
+
+右侧需求清单由 Agent 根据对话填写，用户可以在确认前修改上述字段。服务端必须重新校验城市支持状态和字段范围，不接受前端直接提供的目的地名称作为可信数据。规划完成事件返回准确的 `itinerary_id`，前端在当前窗口打开对应行程详情，不能用列表第一条或上一次行程代替。
+
+固定数据不足以满足每天两个不同景点时，规则规划不得重复或编造景点。系统将现有符合条件的景点均匀分配到各天，把负荷校验标记为 `partial` 并明确保留自由时段；完全没有符合排除条件的景点时才终止规划并要求用户修改条件。
 
 确认成功返回 `202 Accepted`：
 
@@ -1445,6 +1466,8 @@ DELETE /api/v1/auth/sessions/{auth_session_id}
 DELETE /api/v1/auth/me
 ```
 
+`GET /api/v1/auth/me` 返回只读 `public_id`。`DELETE /api/v1/auth/me` 必须再次验证当前密码、校验 CSRF、撤销该用户全部 Token 会话、释放公开 ID 并清除浏览器认证 Cookie；接口不得删除或改绑原内部用户主键下的数据。
+
 密码统一使用 Argon2id 哈希，并在目标服务器上校准参数，使单次验证约为 100～300ms 且不会造成 2 GB 服务器内存压力。已有哈希参数低于当前标准时，在用户下次成功登录后自动重新哈希。密码、重置令牌和 Refresh Token 永远不以明文入库。
 
 Access Token 使用 15 分钟有效的签名 JWT，Refresh Token 使用 7 天有效的高熵随机值并在数据库保存哈希。分别放入 `__Host-access_token` 和 `__Host-refresh_token` Cookie，Cookie 必须设置 `HttpOnly`、`Secure`、`SameSite=Lax`、`Path=/` 且不设置 `Domain`。前端只通过 `/auth/me` 获取用户状态，不读取 Token，也不把 Token 放入 URL、`localStorage` 或 `sessionStorage`。
@@ -1492,15 +1515,19 @@ GET /api/v1/rankings?period=2026Q3&type=attraction&city_id=uuid
 GET    /api/v1/itineraries
 GET    /api/v1/itineraries/{itinerary_id}
 PATCH  /api/v1/itineraries/{itinerary_id}
+PUT    /api/v1/itineraries/{itinerary_id}
 DELETE /api/v1/itineraries/{itinerary_id}
 POST   /api/v1/itineraries/{itinerary_id}/replan
-POST   /api/v1/itineraries/{itinerary_id}/feedback
-GET    /api/v1/itineraries/{itinerary_id}/versions
-POST   /api/v1/itineraries/{itinerary_id}/restore
+GET    /api/v1/itineraries/{itinerary_id}/feedback
+PUT    /api/v1/itineraries/{itinerary_id}/feedback
+GET    /api/v1/itineraries/{itinerary_id}/revisions
+POST   /api/v1/itineraries/{itinerary_id}/revisions/{version_no}/restore
 POST   /api/v1/itineraries/{itinerary_id}/shares
 DELETE /api/v1/itineraries/{itinerary_id}/shares/{share_id}
-GET    /api/v1/shared-itineraries/{share_token}
+GET    /api/v1/shares/{share_token}
 ```
+
+用户端当前的 `PUT` 编辑接口使用 `expected_version` 做并发版本检查；编辑前自动保存快照，恢复历史版本会再创建一条恢复前快照。自然语言调整接口目前只解析明确的天数、预算、删除和替换景点指令，复杂规划仍需真实 LLM 和路线校验服务。
 
 Agent 生成成功时已经创建 `draft` 行程。保存操作使用 `PATCH /api/v1/itineraries/{itinerary_id}` 将 `status` 从 `draft` 更新为 `saved`；重复提交相同状态应保持幂等。所有原地修改携带 `If-Match: "<lock_version>"`，版本不匹配返回 `409 VERSION_CONFLICT` 和当前版本，不允许静默覆盖。
 
@@ -1538,14 +1565,22 @@ Content-Type: application/json
 ### 11.6 用户功能
 
 ```text
-GET    /api/v1/favorites?type=city|attraction
+GET    /api/v1/auth/profile
+PATCH  /api/v1/auth/profile
+GET    /api/v1/auth/sessions
+DELETE /api/v1/auth/sessions/{auth_session_id}
+POST   /api/v1/auth/logout-all
+POST   /api/v1/auth/change-password
+PATCH  /api/v1/auth/me/email
+GET    /api/v1/favorites
 PUT    /api/v1/favorites/{type}/{target_id}
 DELETE /api/v1/favorites/{type}/{target_id}
 GET    /api/v1/recent-views
+POST   /api/v1/recent-views
 DELETE /api/v1/recent-views
 ```
 
-收藏写入和删除均保持幂等，并同步写入对应行为事件。城市或景点详情读取成功后，由服务端异步 upsert 登录用户的最近浏览；用户可以一键清空，单条历史不提供永久保存承诺。账号设置通过认证接口完成，不另建重复用户接口。
+收藏写入和删除均保持幂等。城市和景点详情页使用登录用户的最近浏览记录；用户可以一键清空，单条历史不提供永久保存承诺。当前邮箱接口只完成密码保护下的直接更新，邮箱验证和找回密码待邮件服务接入后实现。
 
 ### 11.7 后台管理
 

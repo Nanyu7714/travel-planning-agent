@@ -17,6 +17,12 @@ venv/
 node_modules/
 dist/
 .vite/
+*.db
+.npm-cache/
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+frontend/src/**/*.js
 
 # Local editor and OS files
 .idea/
@@ -25,6 +31,8 @@ dist/
 Thumbs.db
 
 # Local task logs and commit helpers
+.tmp/
+*-dev.log
 .commitmsg.txt
 .logcheck.txt
 .logcheck2.txt

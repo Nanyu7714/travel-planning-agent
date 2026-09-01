@@ -1,0 +1,338 @@
+:root {
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --muted: #f7f7f7;
+  --text: #222222;
+  --secondary: #6a6a6a;
+  --border: #ebebeb;
+  --border-strong: #c1c1c1;
+  --primary: #ff385c;
+  --primary-dark: #e00b41;
+  --primary-soft: #f7f7f7;
+  --accent: #ff385c;
+  --gold: #222222;
+  --danger: #c13515;
+  --success: #6a6a6a;
+  --radius: 14px;
+  --airbnb-shadow-hover: rgba(0, 0, 0, 0.02) 0 0 0 1px, rgba(0, 0, 0, 0.04) 0 2px 6px 0, rgba(0, 0, 0, 0.1) 0 4px 8px 0;
+  font-family: 'Airbnb Cereal VF', Circular, -apple-system, system-ui, Roboto, 'Helvetica Neue', sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.topbar {
+  height: 80px;
+  background: rgba(255, 255, 255, 0.96);
+  border-bottom-color: var(--border);
+}
+
+.nav-shell {
+  max-width: 1280px;
+  gap: 32px;
+}
+
+.brand {
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.brand-mark {
+  color: var(--primary);
+}
+
+.nav-links {
+  gap: 24px;
+}
+
+.nav-links a {
+  color: var(--secondary);
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.nav-links a:hover {
+  color: var(--text);
+}
+
+.nav-links a.router-link-active {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
+
+.nav-links a,
+.underlined-link,
+.profile-menu a,
+.attraction-row,
+.ranking-row {
+  transition: color 180ms ease, background-color 180ms ease, border-color 180ms ease;
+}
+
+.account-name,
+.text-button,
+.icon-button,
+.menu-button {
+  color: var(--text);
+}
+
+.login-button,
+.primary-button {
+  min-height: 48px;
+  padding: 14px 24px;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.login-button:hover,
+.primary-button:hover {
+  background: var(--primary-dark);
+}
+
+.login-button:active,
+.primary-button:active,
+.secondary-button:active,
+.send-button:active,
+.home-search button:active {
+  transform: scale(0.98);
+}
+
+.secondary-button {
+  min-height: 48px;
+  padding: 13px 23px;
+  border: 1px solid var(--text);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.secondary-button:hover {
+  background: var(--muted);
+}
+
+.danger-button {
+  border-radius: 8px;
+  background: var(--muted);
+}
+
+.page-container {
+  max-width: 1280px;
+  padding: 64px 24px 80px;
+}
+
+h1 {
+  color: var(--text);
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.43;
+  letter-spacing: 0;
+}
+
+h2 {
+  color: var(--text);
+  font-size: 21px;
+  font-weight: 700;
+  line-height: 1.43;
+  letter-spacing: 0;
+}
+
+h3 {
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+p {
+  color: var(--secondary);
+  font-size: 14px;
+  line-height: 1.43;
+}
+
+.eyebrow {
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.6px;
+}
+
+.home-intro {
+  min-height: 420px;
+  gap: 48px;
+}
+
+.home-intro h1 {
+  max-width: 560px;
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.43;
+}
+
+.home-intro h1 em {
+  color: var(--primary);
+}
+
+.intro-note {
+  border-left-color: var(--primary);
+}
+
+.section-block {
+  padding-top: 64px;
+}
+
+.section-heading {
+  margin-bottom: 16px;
+}
+
+.section-count {
+  color: var(--secondary);
+}
+
+.content-grid {
+  gap: 32px;
+}
+
+.popular-city-grid,
+.city-grid {
+  gap: 16px;
+}
+
+.city-card {
+  height: auto;
+  border: 0;
+  border-radius: 14px;
+  position: static;
+  text-align: left;
+}
+
+.city-card-overlay {
+  background: transparent;
+}
+
+.home-search {
+  max-width: 300px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9999px;
+  background: var(--surface);
+}
+
+.home-search input {
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 9999px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.home-search input:focus {
+  outline: 2px solid var(--text);
+  outline-offset: -2px;
+}
+
+.home-search button {
+  width: 48px;
+  height: 48px;
+  flex: none;
+  border-radius: 9999px;
+  background: var(--primary);
+}
+
+.home-search button:hover {
+  background: var(--primary-dark);
+}
+
+.attraction-row,
+.ranking-row {
+  border-color: var(--border);
+}
+
+.attraction-row:hover,
+.ranking-row:hover {
+  background: var(--muted);
+}
+
+.underlined-link:hover {
+  color: var(--primary-dark);
+}
+
+.profile-menu a:hover {
+  color: var(--text);
+  background: var(--muted);
+}
+
+.tag-line span,
+.admin-badge,
+.summary-tip,
+.session-item.active {
+  color: var(--text);
+  background: var(--muted);
+}
+
+.modal-panel {
+  border-radius: 14px;
+  box-shadow: var(--airbnb-shadow-hover);
+}
+
+.modal-panel input,
+.composer textarea {
+  border-color: var(--border-strong);
+  border-radius: 8px;
+}
+
+.modal-panel input:focus,
+.composer textarea:focus {
+  border-color: var(--text);
+}
+
+.loading-state,
+.empty-state {
+  color: var(--secondary);
+}
+
+button:focus-visible,
+a:focus-visible,
+textarea:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (max-width: 720px) {
+  .topbar {
+    height: 64px;
+  }
+
+  .nav-links {
+    top: 64px;
+    background: var(--surface);
+  }
+
+  .page-container {
+    padding-top: 40px;
+  }
+
+  .home-intro h1 {
+    font-size: 28px;
+  }
+}

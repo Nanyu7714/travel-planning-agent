@@ -1,0 +1,10 @@
+<script setup lang="ts">
+import { onMounted, ref } from 'vue'
+import { Inbox, Star } from 'lucide-vue-next'
+import { api } from '../api'
+type Feedback = { id:number; itinerary_id:number; username:string; email:string; city_name:string; itinerary_title:string; rating:number; comment:string; created_at:string; updated_at:string }
+const items = ref<Feedback[]>([]); const error = ref('')
+onMounted(async () => { try { items.value = await api<Feedback[]>('/admin/feedback') } catch (e) { error.value = e instanceof Error ? e.message : '反馈加载失败' } })
+</script>
+<template><div class="page-container"><AdminModuleHeader eyebrow="FEEDBACK INBOX" title="反馈收件箱" description="集中查看用户对已生成行程的评分和评论。" /><div v-if="error" class="empty-state"><Inbox :size="28" /><h2>{{ error }}</h2></div><div v-else-if="!items.length" class="empty-state"><Inbox :size="28" /><h2>暂时没有用户反馈</h2></div><div v-else class="feedback-list"><article v-for="item in items" :key="item.id" class="feedback-item"><div class="feedback-head"><strong>{{ item.username }}</strong><span>{{ item.email }}</span><time>{{ new Date(item.created_at).toLocaleString() }}</time></div><div class="feedback-meta"><span>{{ item.city_name }} · {{ item.itinerary_title }}</span><strong><Star :size="15" fill="currentColor" /> {{ item.rating }}/10</strong></div><p>{{ item.comment || '用户未留下文字评论' }}</p></article></div></div></template>
+<style scoped>.feedback-list{margin-top:34px;border-top:1px solid var(--border)}.feedback-item{padding:18px 0;border-bottom:1px solid var(--border)}.feedback-head,.feedback-meta{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.feedback-head span,.feedback-head time{color:var(--secondary);font-size:11px}.feedback-head time{margin-left:auto}.feedback-meta{justify-content:space-between;margin-top:12px;color:var(--primary);font-size:13px}.feedback-meta strong{display:flex;align-items:center;gap:5px;color:var(--accent)}.feedback-item p{margin:12px 0 0}@media(max-width:600px){.feedback-head time{margin-left:0;width:100%}}</style>

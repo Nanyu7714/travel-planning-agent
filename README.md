@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-仓库目前处于 V1.2 设计和开发准备阶段，只包含开发文档与 UI 规范，尚未提交可运行的前端、后端、数据库迁移或测试代码。因此当前没有有效的安装、启动和测试命令；创建工程骨架后必须在本节补充经过实际验证的命令，不能提供无法运行的占位指令。
+仓库已经包含一个可运行的 MVP 工程骨架：Vue 前端、FastAPI 后端、SQLite 本地数据、Cookie 登录与 7 天自动续期、4 位公开用户 ID、Agent 规则规划、SSE 进度推送、行程管理和管理员概览。生产环境仍按开发文档切换到 PostgreSQL。
 
 ## MVP 范围
 
@@ -12,6 +12,7 @@
 - 通过多轮对话收集目的地、天数、预算、兴趣和节奏。
 - 生成并校验 2～5 天游，支持修订、保存、历史版本和只读分享。
 - 支持收藏、最近浏览、账号设置和用户反馈。
+- 注册后分配唯一的 4 位公开用户 ID，支持用户名、邮箱或用户 ID 加密码登录；个人资料页只读展示该 ID，并支持验证密码后注销账号。
 - 支持城市、景点、数据导入、排行、反馈和审计后台。
 
 明确不包含酒店、机票、门票预订和支付，不支持复杂跨城市行程，也不提供实时导航。
@@ -23,10 +24,93 @@
 - Agent：REST 提交、PostgreSQL 持久化任务、单规划 Worker、SSE 事件流。
 - 部署：Alibaba Cloud Linux 3、宝塔 Nginx、Uvicorn、PostgreSQL、Let's Encrypt。
 
+## 本地启动
+
+推荐 Python 3.12（后端代码兼容 Python 3.13），Node.js 使用 LTS 版本。
+
+后端：
+
+```powershell
+cd backend
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+uvicorn app.main:app --reload --port 8000
+```
+
+前端另开终端：
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+打开 `http://localhost:5173`。本地默认使用 SQLite（数据库文件位于仓库根目录），首次启动会自动创建表和示例数据。
+
+管理员账号由部署人员在服务端初始化和管理，不在前端或项目文档中公开凭据。
+
+## Agent 演示
+
+登录后进入“AI 规划”，输入：
+
+```text
+我想去成都玩 4 天，喜欢美食和慢节奏
+```
+
+当前 MVP 使用固定景点数据和可复现的规则规划，并通过 SSE 推送规划阶段。普通对话和行程交付说明在配置后端大模型后调用模型；景点选择、时间、价格和约束仍以数据库及规则结果为准。将 `INLINE_WORKER` 设置为 `false` 后，需要额外启动：
+
+```powershell
+cd backend
+.\.venv\Scripts\Activate.ps1
+python -m app.workers.planning
+```
+
+## 环境变量
+
+复制 `backend/.env.example` 为 `backend/.env`。生产环境将 `DATABASE_URL` 改为 PostgreSQL 连接串：
+
+```env
+DATABASE_URL=postgresql+psycopg://travel_user:密码@127.0.0.1:5432/travel_platform
+```
+
+大模型 Key、数据库密码、JWT 密钥和高德 Web Service Key 只能放在后端环境变量中，`.env` 不能提交到 Git。正式部署前必须修改 `JWT_SECRET`、`CSRF_SECRET` 和管理员密码。
+
+大模型使用兼容 OpenAI Chat Completions 的后端接口。项目不会自动创建或修改 `.env`，请根据所使用的服务填写：
+
+```env
+LLM_API_KEY=你的服务端密钥
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+LLM_TIMEOUT_SECONDS=30
+LLM_MAX_TOKENS=500
+```
+
+未配置 `LLM_API_KEY` 时，页面会明确显示“使用本地对话模式”；首次模型请求成功后显示“已连接”，调用失败则自动降级且不会影响城市浏览和规则规划。
+
+## 测试和构建
+
+```powershell
+cd backend
+python -m pytest
+
+cd ..\frontend
+npm run build
+```
+
+## 生产部署概要
+
+Vue 构建结果放入 `/www/wwwroot/travel-web/`，FastAPI 项目放入 `/www/wwwroot/travel-api/`。生产环境使用一个 Uvicorn Worker 和一个规划 Worker，由 Nginx 转发 `/api/` 到 `127.0.0.1:8000`，SSE 路由关闭代理缓冲，并配置 HTTPS、每日 PostgreSQL 备份和健康检查。
+
 ## 项目文档
 
 - [开发文档](旅游规划咨询Agent-开发文档.md)
 - [样式设计文档](旅游规划咨询Agent-样式设计文档.md)
+- [开发记录](docs/开发记录.md)
+- [审查文档](docs/审查文档.md)
+- [媒体资源管理](docs/媒体资源管理.md)
+- [未实现功能清单](docs/未实现功能.md)
 
 字段、状态、接口和错误码以开发文档为准；布局、交互和组件状态以样式设计文档为准。两份文档冲突时先修订文档，再开始实现。
 
@@ -38,7 +122,7 @@
 4. 完成 Agent Worker、SSE、推荐评分、路线规划和约束校验。
 5. 完成用户端、后台、自动化测试、数据导入与部署演练。
 
-首次提交可运行代码时，README 还必须增加：环境要求、`.env.example`、数据库创建和迁移、初始化数据导入、前后端启动、测试、构建、部署和故障排查命令。
+当前已实现城市/景点详情、城市内热度排行、行程工作台编辑与版本、只读分享、收藏/最近浏览、用户主页、账号设备管理和反馈收件箱；邮箱验证、找回密码、真实图片、地图、实时热点和正式 PostgreSQL 迁移仍见 [未实现功能清单](docs/未实现功能.md)。
 
 ## 仓库地址
 
