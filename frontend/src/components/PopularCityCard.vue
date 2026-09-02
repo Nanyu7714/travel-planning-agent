@@ -6,50 +6,55 @@ import type { City } from '../api'
 defineProps<{
   city: City
   attractionCount: number
+  rank?: number
+  active?: boolean
 }>()
 
 const imageFailed = ref(false)
 </script>
 
 <template>
-  <RouterLink class="popular-city-card" :to="`/cities/${city.slug}`" :aria-label="`查看${city.name}城市详情`">
+  <button type="button" :class="['popular-city-card', { active }]" :aria-label="`选择${city.name}，查看该城市的路线灵感`" :aria-pressed="active">
     <div class="popular-city-card__image">
-      <img v-if="city.image_url && !imageFailed" :src="city.image_url" :alt="`${city.name}城市景观`" @error="imageFailed = true" />
+      <img v-if="city.image_url && !imageFailed" :src="city.image_url" :alt="`${city.name}城市景观`" :draggable="false" @error="imageFailed = true" />
       <div v-else class="popular-city-card__fallback" aria-hidden="true">
         <MapPin :size="22" />
         <span>图片待核验</span>
       </div>
+      <span v-if="rank" class="popular-city-card__rank">TOP {{ String(rank).padStart(2, '0') }}</span>
     </div>
     <div class="popular-city-card__meta">
       <h3>{{ city.name }}</h3>
       <span class="popular-city-card__badge">{{ attractionCount }} 个景点</span>
     </div>
-  </RouterLink>
+  </button>
 </template>
 
 <style scoped>
 .popular-city-card {
-  --airbnb-canvas: #ffffff;
-  --airbnb-ink: #222222;
-  --airbnb-surface-soft: #f7f7f7;
-  --airbnb-muted: #6a6a6a;
-  --airbnb-radius-card: 14px;
-  --airbnb-radius-pill: 9999px;
-  --airbnb-shadow-hover: rgba(0, 0, 0, 0.02) 0 0 0 1px, rgba(0, 0, 0, 0.04) 0 2px 6px 0, rgba(0, 0, 0, 0.1) 0 4px 8px 0;
   display: block;
   width: 100%;
+  padding: 0;
+  border: 0;
   overflow: hidden;
-  color: var(--airbnb-ink);
-  background: var(--airbnb-canvas);
-  border-radius: var(--airbnb-radius-card);
+  color: var(--color-ink);
+  background: var(--color-surface);
+  border-radius: var(--radius-card);
+  cursor: pointer;
+  text-align: left;
   text-decoration: none;
   transition: transform 180ms ease, box-shadow 180ms ease;
 }
 
+.popular-city-card.active {
+  box-shadow: inset 0 0 0 2px var(--color-primary);
+}
+
 .popular-city-card__image {
+  position: relative;
   aspect-ratio: 4 / 3;
   overflow: hidden;
-  background: var(--airbnb-surface-soft);
+  background: var(--color-surface-soft);
 }
 
 .popular-city-card__image img,
@@ -61,6 +66,20 @@ const imageFailed = ref(false)
 
 .popular-city-card__image img {
   object-fit: cover;
+  transition: transform 280ms ease;
+}
+
+.popular-city-card__rank {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  color: var(--color-ink);
+  background: var(--color-canvas);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.18;
 }
 
 .popular-city-card__fallback {
@@ -68,7 +87,7 @@ const imageFailed = ref(false)
   place-content: center;
   justify-items: center;
   gap: 8px;
-  color: var(--airbnb-muted);
+  color: var(--color-muted);
   font-size: 11px;
 }
 
@@ -84,7 +103,7 @@ const imageFailed = ref(false)
 .popular-city-card h3 {
   min-width: 0;
   margin: 0;
-  color: var(--airbnb-ink);
+  color: var(--color-ink);
   font-family: 'Airbnb Cereal VF', Circular, -apple-system, system-ui, Roboto, 'Helvetica Neue', sans-serif;
   font-size: 16px;
   font-weight: 600;
@@ -96,9 +115,9 @@ const imageFailed = ref(false)
 .popular-city-card__badge {
   flex: none;
   padding: 4px 10px;
-  color: var(--airbnb-ink);
-  background: var(--airbnb-surface-soft);
-  border-radius: var(--airbnb-radius-pill);
+  color: var(--color-ink);
+  background: var(--color-surface-soft);
+  border-radius: var(--radius-pill);
   font-family: 'Airbnb Cereal VF', Circular, -apple-system, system-ui, Roboto, 'Helvetica Neue', sans-serif;
   font-size: 11px;
   font-weight: 600;
@@ -107,14 +126,22 @@ const imageFailed = ref(false)
 }
 
 .popular-city-card:focus-visible {
-  outline: 2px solid var(--airbnb-ink);
+  outline: 2px solid var(--color-ink);
   outline-offset: 4px;
 }
 
 @media (hover: hover) and (pointer: fine) {
   .popular-city-card:hover {
-    transform: translateY(-4px);
-    box-shadow: var(--airbnb-shadow-hover);
+    transform: translateY(-3px);
+    box-shadow: var(--shadow-hover);
+  }
+
+  .popular-city-card.active:hover {
+    box-shadow: inset 0 0 0 2px var(--color-primary), var(--shadow-hover);
+  }
+
+  .popular-city-card:hover .popular-city-card__image img {
+    transform: scale(1.04);
   }
 }
 

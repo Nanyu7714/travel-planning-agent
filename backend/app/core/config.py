@@ -11,6 +11,16 @@ class Settings(BaseSettings):
     csrf_secret: str = "dev-csrf-secret-change-me"
     access_token_minutes: int = 15
     refresh_token_days: int = 7
+    environment: str = "development"
+    mail_delivery_mode: str = "console"
+    mail_from: str = "noreply@travel.local"
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_starttls: bool = True
+    auth_email_token_minutes: int = 30
+    password_reset_token_minutes: int = 30
     inline_worker: bool = True
     llm_api_key: str | None = None
     llm_base_url: str = "https://api.openai.com/v1"

@@ -1,27 +1,32 @@
 import asyncio
+import hashlib
 import hmac
 import json
+import logging
 import re
 import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlencode, urlsplit
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete, func, inspect, select, text, update
+from sqlalchemy import delete, func, inspect, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.security import create_access_token, decode_access_token, hash_password, new_csrf_token, new_refresh_token, token_hash, verify_password
+from app.core.security import create_access_token, decode_access_token, hash_password, new_csrf_token, new_refresh_token, password_needs_rehash, token_hash, verify_password
 from app.db import Base, SessionLocal, engine, get_db
 from app.llm import get_llm_status
-from app.models import AgentEvent, Attraction, AuthSession, ChatMessage, ChatSession, City, Favorite, IdempotencyRecord, Itinerary, ItineraryDay, ItineraryFeedback, ItineraryRevision, ItineraryStop, ItineraryValidation, MediaAsset, PlanningJob, RecentView, ShareLink, User, UserProfile
-from app.schemas import AccountDeleteIn, AdminFeedbackOut, AdminSessionOut, AdminUserOut, AdminUserUpdateIn, AttractionOut, AuthSessionOut, CityOut, EmailChangeIn, FeedbackIn, FeedbackOut, ItineraryRevisionOut, ItineraryUpdateIn, LoginIn, MediaAssetOut, MessageIn, MessageOut, PasswordChangeIn, PlanConfirmIn, RegisterIn, ReplanIn, SessionOut, SessionUpdateIn, ShareCreateIn, ShareOut, UserOut, UserProfileOut, UserProfileUpdateIn
+from app.mail import AuthMail, MailDeliveryError, send_auth_mail
+from app.media import search_commons_image
+from app.models import AdminAuditLog, AgentEvent, AgentRun, AgentToolCall, Attraction, AuthActionToken, AuthRateLimitBucket, AuthSession, ChatMessage, ChatSession, City, CommunityComment, CommunityPost, CommunityPostFavorite, CommunityPostImage, CommunityPostLike, ContentReport, Favorite, IdempotencyRecord, Itinerary, ItineraryDay, ItineraryFeedback, ItineraryRevision, ItineraryStop, ItineraryValidation, MediaAsset, PlanningJob, RankingEntry, RecentView, ShareLink, User, UserProfile
+from app.schemas import AccountDeleteIn, AdminAttractionCreateIn, AdminAttractionImportIn, AdminAttractionOut, AdminAttractionUpdateIn, AdminAuditLogOut, AdminAuditLogPageOut, AdminCityCreateIn, AdminCityImportIn, AdminCityOut, AdminCityUpdateIn, AdminFeedbackOut, AdminFeedbackPageOut, AdminItineraryOut, AdminItineraryPageOut, AdminRankingCreateIn, AdminRankingImportIn, AdminRankingOut, AdminRankingUpdateIn, AdminSessionOut, AdminSessionPageOut, AdminUserOut, AdminUserPageOut, AdminUserUpdateIn, AttractionOut, AuthActionOut, AuthSessionOut, AuthTokenIn, CityOut, CommunityCommentCreateIn, CommunityPostCreateIn, CommunityPostUpdateIn, CommunityStatusUpdateIn, ContentReportCreateIn, ContentReportStatusUpdateIn, EmailChangeIn, EmailRequestIn, FeedbackIn, FeedbackOut, ItineraryRevisionOut, ItineraryUpdateIn, LoginIn, MediaAssetOut, MediaAssetUpdateIn, MessageIn, MessageOut, PasswordChangeIn, PasswordResetIn, PlanConfirmIn, RegisterIn, ReplanIn, SessionBulkUpdateIn, SessionOut, SessionUpdateIn, ShareCreateIn, ShareOut, UserOut, UserProfileOut, UserProfileUpdateIn
 from app.services import CITY_NAMES, confirmation_message, itinerary_dict, latest_confirmation, process_job_async
 
 
@@ -29,9 +34,11 @@ from app.services import CITY_NAMES, confirmation_message, itinerary_dict, lates
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     ensure_user_identity_columns()
+    ensure_auth_security_columns()
     ensure_user_profile_columns()
     ensure_itinerary_columns()
     ensure_session_management_columns()
+    ensure_content_status_columns()
     seed_database()
     backfill_user_public_ids()
     backfill_session_titles()
@@ -43,6 +50,7 @@ app.add_middleware(CORSMiddleware, allow_origins=[settings.app_base_url], allow_
 MEDIA_ROOT = Path(__file__).resolve().parent.parent / "media"
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=MEDIA_ROOT), name="media")
+logger = logging.getLogger(__name__)
 
 
 def ensure_user_identity_columns() -> None:
@@ -56,6 +64,18 @@ def ensure_user_identity_columns() -> None:
         connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_public_id ON users (public_id)"))
 
 
+def ensure_auth_security_columns() -> None:
+    """Mark pre-existing accounts verified once when upgrading a development database."""
+    columns = {column["name"] for column in inspect(engine).get_columns("users")}
+    if "email_verified_at" in columns:
+        return
+    timestamp_type = "TIMESTAMP" if engine.dialect.name == "postgresql" else "DATETIME"
+    with engine.begin() as connection:
+        connection.execute(text(f"ALTER TABLE users ADD COLUMN email_verified_at {timestamp_type}"))
+        connection.execute(text("UPDATE users SET email_verified_at = created_at WHERE email_verified_at IS NULL"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_users_email_verified_at ON users (email_verified_at)"))
+
+
 def ensure_user_profile_columns() -> None:
     columns = {column["name"] for column in inspect(engine).get_columns("user_profiles")}
     with engine.begin() as connection:
@@ -67,9 +87,13 @@ def ensure_user_profile_columns() -> None:
 
 def ensure_itinerary_columns() -> None:
     columns = {column["name"] for column in inspect(engine).get_columns("itineraries")}
+    timestamp_type = "TIMESTAMP" if engine.dialect.name == "postgresql" else "DATETIME"
     with engine.begin() as connection:
         if "preferences" not in columns:
             connection.execute(text("ALTER TABLE itineraries ADD COLUMN preferences JSON" if engine.dialect.name == "sqlite" else "ALTER TABLE itineraries ADD COLUMN preferences JSONB"))
+        if "deleted_at" not in columns:
+            connection.execute(text(f"ALTER TABLE itineraries ADD COLUMN deleted_at {timestamp_type}"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_itineraries_deleted_at ON itineraries (deleted_at)"))
 
 
 def allocate_public_id(db: Session) -> str:
@@ -114,11 +138,21 @@ def ensure_session_management_columns() -> None:
                 connection.execute(text(f"ALTER TABLE chat_sessions ADD COLUMN {name} {definition}"))
 
 
+def ensure_content_status_columns() -> None:
+    """Backfill publish status for development databases created before content deactivation."""
+    with engine.begin() as connection:
+        for table in ("cities", "attractions"):
+            columns = {column["name"] for column in inspect(engine).get_columns(table)}
+            if "is_active" not in columns:
+                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT true"))
+            connection.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_is_active ON {table} (is_active)"))
+
+
 def seed_database() -> None:
     db = SessionLocal()
     try:
         if not db.scalar(select(User).where(User.username == "admin")):
-            db.add(User(username="admin", email="admin@travel.local", password_hash=hash_password("123456"), role="admin"))
+            db.add(User(username="admin", email="admin@travel.local", password_hash=hash_password("123456"), role="admin", email_verified_at=datetime.now(timezone.utc).replace(tzinfo=None)))
         if not db.scalar(select(City)):
             cities = [
                 City(slug="beijing", name="北京", aliases=["北京市"], description="古都人文与现代城市交织，适合第一次深度认识中国北方。", season="春秋最佳，四季皆有看点", budget="¥300-600/天", recommended_days="3-5天", image_url="https://images.unsplash.com/photo-1508804185872-d7badad00f7d?auto=format&fit=crop&w=1200&q=80"),
@@ -234,17 +268,46 @@ def sync_media_catalog(db: Session) -> None:
             attraction.image_url = asset.url if asset.is_active and asset.url else ""
 
 
+def media_display_url(asset: MediaAsset) -> str | None:
+    if asset.storage_type == "local_file" and asset.storage_path:
+        return f"/media/{asset.storage_path.lstrip('/')}"
+    return asset.url
+
+
+def sync_media_display_target(db: Session, asset: MediaAsset) -> None:
+    display_url = media_display_url(asset) if asset.is_active and asset.verification_status == "approved" else ""
+    if asset.attraction_id is not None:
+        attraction = db.get(Attraction, asset.attraction_id)
+        if attraction:
+            attraction.image_url = display_url or ""
+    elif asset.purpose == "city_cover":
+        city = db.get(City, asset.city_id)
+        if city:
+            city.image_url = display_url or ""
+
+
 def current_user(request: Request, db: Session = Depends(get_db)) -> User:
     token = request.cookies.get("__Host-access_token") or request.cookies.get("access_token")
     if not token:
         raise HTTPException(status_code=401, detail="请先登录")
     try:
         payload = decode_access_token(token)
-        user = db.get(User, int(payload["sub"]))
+        user_id = int(payload["sub"])
+        session_id = int(payload["sid"])
+        user = db.get(User, user_id)
+        auth_session = db.scalar(select(AuthSession).where(
+            AuthSession.id == session_id,
+            AuthSession.user_id == user_id,
+            AuthSession.revoked_at.is_(None),
+        ))
     except Exception as exc:
         raise HTTPException(status_code=401, detail="登录状态已失效") from exc
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="账号不可用")
+    if not auth_session or auth_session.expires_at <= now:
+        raise HTTPException(status_code=401, detail="登录状态已失效")
+    request.state.auth_session = auth_session
     return user
 
 
@@ -260,14 +323,156 @@ def require_admin(user: User) -> None:
         raise HTTPException(403, "需要管理员权限")
 
 
+def record_admin_audit(db: Session, user: User, action: str, target_type: str, target_id: int | None, summary: str, payload: dict | None = None) -> None:
+    db.add(AdminAuditLog(
+        actor_user_id=user.id,
+        actor_username=user.username,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        summary=summary,
+        payload=payload,
+    ))
+
+
 def ensure_csrf(request: Request) -> None:
     expected = request.cookies.get("csrf_token")
     supplied = request.headers.get("X-CSRF-Token")
-    if expected and supplied and expected == supplied:
-        return
-    # Login and public read operations do not need CSRF. Mutating authenticated calls do.
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and (request.cookies.get("__Host-access_token") or request.cookies.get("access_token")):
+    auth_session = getattr(request.state, "auth_session", None)
+    valid = bool(
+        expected
+        and supplied
+        and auth_session
+        and hmac.compare_digest(expected, supplied)
+        and hmac.compare_digest(auth_session.csrf_token_hash, token_hash(expected))
+    )
+    if not valid:
         raise HTTPException(status_code=403, detail="CSRF 校验失败")
+
+
+AUTH_RATE_RULES = {
+    "login": (900, 5, 60),
+    "register": (3600, 5, 30),
+    "resend_verification": (3600, 3, 30),
+    "verify_email": (900, 10, 40),
+    "forgot_password": (3600, 3, 30),
+    "reset_password": (900, 10, 40),
+    "change_email": (3600, 5, 30),
+    "confirm_email_change": (900, 10, 40),
+}
+
+
+def ensure_public_origin(request: Request) -> None:
+    origin = request.headers.get("Origin")
+    if not origin or hmac.compare_digest(origin.rstrip("/"), settings.app_base_url.rstrip("/")):
+        return
+    origin_host = urlsplit(origin).hostname
+    expected_host = urlsplit(settings.app_base_url).hostname
+    if settings.environment == "development" and origin_host in {"localhost", "127.0.0.1"} and expected_host in {"localhost", "127.0.0.1"}:
+        return
+    raise HTTPException(status_code=403, detail="请求来源不受信任")
+
+
+def _rate_scope_hash(scope_type: str, value: str) -> str:
+    normalized = value.strip().lower()
+    return hmac.new(settings.csrf_secret.encode(), f"{scope_type}:{normalized}".encode(), hashlib.sha256).hexdigest()
+
+
+def enforce_auth_rate_limit(db: Session, request: Request, action: str, account_key: str) -> None:
+    window_seconds, account_limit, ip_limit = AUTH_RATE_RULES[action]
+    client_ip = request.client.host if request.client else "unknown"
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for scope_type, value, limit in (("account", account_key, account_limit), ("ip", client_ip, ip_limit)):
+        scope_hash = _rate_scope_hash(scope_type, value)
+        bucket = db.scalar(select(AuthRateLimitBucket).where(
+            AuthRateLimitBucket.action == action,
+            AuthRateLimitBucket.scope_type == scope_type,
+            AuthRateLimitBucket.scope_hash == scope_hash,
+        ))
+        if bucket is None:
+            bucket = AuthRateLimitBucket(
+                action=action,
+                scope_type=scope_type,
+                scope_hash=scope_hash,
+                window_started_at=now,
+                attempt_count=0,
+            )
+            db.add(bucket)
+            db.flush()
+        window_ends_at = bucket.window_started_at + timedelta(seconds=window_seconds)
+        if now >= window_ends_at:
+            bucket.window_started_at = now
+            bucket.attempt_count = 0
+            bucket.blocked_until = None
+            window_ends_at = now + timedelta(seconds=window_seconds)
+        if bucket.blocked_until and bucket.blocked_until > now:
+            retry_after = max(1, int((bucket.blocked_until - now).total_seconds()))
+            raise HTTPException(429, "请求过于频繁，请稍后再试", headers={"Retry-After": str(retry_after)})
+        if bucket.attempt_count >= limit:
+            bucket.blocked_until = window_ends_at
+            db.commit()
+            retry_after = max(1, int((window_ends_at - now).total_seconds()))
+            raise HTTPException(429, "请求过于频繁，请稍后再试", headers={"Retry-After": str(retry_after)})
+        bucket.attempt_count += 1
+    db.commit()
+
+
+def clear_auth_account_rate_limit(db: Session, action: str, account_key: str) -> None:
+    db.execute(delete(AuthRateLimitBucket).where(
+        AuthRateLimitBucket.action == action,
+        AuthRateLimitBucket.scope_type == "account",
+        AuthRateLimitBucket.scope_hash == _rate_scope_hash("account", account_key),
+    ))
+    db.commit()
+
+
+def issue_auth_action(db: Session, user: User, purpose: str, target_email: str, path: str, expires_minutes: int) -> str | None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.execute(update(AuthActionToken).where(
+        AuthActionToken.user_id == user.id,
+        AuthActionToken.purpose == purpose,
+        AuthActionToken.used_at.is_(None),
+    ).values(used_at=now))
+    raw_token = secrets.token_urlsafe(48)
+    db.add(AuthActionToken(
+        user_id=user.id,
+        purpose=purpose,
+        token_hash=token_hash(raw_token),
+        target_email=target_email,
+        expires_at=now + timedelta(minutes=expires_minutes),
+    ))
+    db.commit()
+    action_url = f"{settings.app_base_url.rstrip('/')}{path}?{urlencode({'token': raw_token})}"
+    subject_map = {
+        "verify_email": "验证你的行旅邮箱",
+        "reset_password": "重置你的行旅密码",
+        "change_email": "确认新的行旅邮箱",
+    }
+    body_map = {
+        "verify_email": f"请打开下面的链接验证邮箱。链接将在 {expires_minutes} 分钟后失效。\n\n{action_url}",
+        "reset_password": f"请打开下面的链接重置密码。链接将在 {expires_minutes} 分钟后失效。\n\n{action_url}",
+        "change_email": f"请打开下面的链接确认新邮箱。链接将在 {expires_minutes} 分钟后失效。\n\n{action_url}",
+    }
+    try:
+        send_auth_mail(AuthMail(recipient=target_email, subject=subject_map[purpose], body=body_map[purpose]))
+    except MailDeliveryError as exc:
+        logger.warning("Auth email delivery failed: %s", type(exc).__name__)
+    if settings.environment == "development" and settings.mail_delivery_mode == "console":
+        return action_url
+    return None
+
+
+def valid_auth_action(db: Session, raw_token: str, purpose: str) -> AuthActionToken:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    action_token = db.scalar(select(AuthActionToken).where(
+        AuthActionToken.token_hash == token_hash(raw_token),
+        AuthActionToken.purpose == purpose,
+        AuthActionToken.used_at.is_(None),
+        AuthActionToken.expires_at > now,
+    ))
+    if action_token is None:
+        raise HTTPException(400, "链接无效、已过期或已经使用")
+    return action_token
 
 
 def require_idempotency_key(value: str | None) -> str:
@@ -314,10 +519,11 @@ def set_auth_cookies(response: Response, user: User, request: Request, db: Sessi
         auth_session.csrf_token_hash = token_hash(csrf_token)
         auth_session.last_used_at = now
         auth_session.expires_at = expires_at
+    db.flush()
     db.commit()
     response.set_cookie(
         access_cookie,
-        create_access_token(user.id, user.role),
+        create_access_token(user.id, user.role, auth_session.id),
         max_age=settings.access_token_minutes * 60,
         httponly=True,
         secure=secure,
@@ -365,9 +571,24 @@ def agent_status():
     return get_llm_status()
 
 
+@app.get("/api/v1/admin/agent-status")
+def admin_agent_status(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Diagnostics are restricted to administrators so model failure details stay out of the public UI."""
+    require_admin(user)
+    status_payload = get_llm_status(include_diagnostics=True)
+    status_payload["runs"] = {
+        "completed": db.scalar(select(func.count(AgentRun.id)).where(AgentRun.status == "completed")) or 0,
+        "failed": db.scalar(select(func.count(AgentRun.id)).where(AgentRun.status == "failed")) or 0,
+        "running": db.scalar(select(func.count(AgentRun.id)).where(AgentRun.status == "running")) or 0,
+    }
+    return status_payload
+
+
 @app.post("/api/v1/auth/login", response_model=UserOut)
 def login(data: LoginIn, response: Response, request: Request, db: Session = Depends(get_db)):
+    ensure_public_origin(request)
     account = data.account.strip()
+    enforce_auth_rate_limit(db, request, "login", account)
     user = db.scalar(select(User).where(
         User.is_active.is_(True),
         (func.lower(User.username) == account.lower()) | (func.lower(User.email) == account.lower()),
@@ -376,23 +597,35 @@ def login(data: LoginIn, response: Response, request: Request, db: Session = Dep
         user = db.scalar(select(User).where(User.public_id == account, User.is_active.is_(True)))
     if not user or not verify_password(data.password, user.password_hash):
         raise HTTPException(status_code=401, detail="账号或密码错误")
-    if not user.is_active:
-        raise HTTPException(status_code=401, detail="账号不可用")
+    if user.email_verified_at is None:
+        raise HTTPException(status_code=403, detail="邮箱尚未验证，请先完成邮箱验证")
+    if password_needs_rehash(user.password_hash):
+        user.password_hash = hash_password(data.password)
+        db.commit()
+    clear_auth_account_rate_limit(db, "login", account)
     set_auth_cookies(response, user, request, db)
     return user
 
 
-@app.post("/api/v1/auth/register", response_model=UserOut, status_code=201)
-def register(data: RegisterIn, response: Response, request: Request, db: Session = Depends(get_db)):
+@app.post("/api/v1/auth/register", response_model=AuthActionOut, status_code=202)
+def register(data: RegisterIn, request: Request, db: Session = Depends(get_db)):
+    ensure_public_origin(request)
     username = data.username.strip()
     email = str(data.email).strip().lower()
+    enforce_auth_rate_limit(db, request, "register", email)
     if re.fullmatch(r"\d{4}", username):
         raise HTTPException(status_code=422, detail="用户名不能是 4 位纯数字，以免与用户 ID 混淆")
-    if db.scalar(select(User).where((User.username == username) | (User.email == email))):
-        raise HTTPException(status_code=409, detail="账号或邮箱已经注册")
+    existing = db.scalar(select(User).where((User.username == username) | (User.email == email)))
+    dev_action_url = None
+    if existing:
+        if existing.is_active and existing.email.lower() == email and existing.email_verified_at is None:
+            dev_action_url = issue_auth_action(
+                db, existing, "verify_email", existing.email, "/auth/verify-email", settings.auth_email_token_minutes,
+            )
+        return {"message": "如果资料可用，验证邮件已发送，请检查邮箱。", "dev_action_url": dev_action_url}
     password_hash = hash_password(data.password)
     for _ in range(10):
-        user = User(public_id=allocate_public_id(db), username=username, email=email, password_hash=password_hash, role="user")
+        user = User(public_id=allocate_public_id(db), username=username, email=email, password_hash=password_hash, role="user", email_verified_at=None)
         db.add(user)
         try:
             db.commit()
@@ -400,12 +633,84 @@ def register(data: RegisterIn, response: Response, request: Request, db: Session
         except IntegrityError:
             db.rollback()
             if db.scalar(select(User).where((User.username == username) | (User.email == email))):
-                raise HTTPException(status_code=409, detail="账号或邮箱已经注册")
+                return {"message": "如果资料可用，验证邮件已发送，请检查邮箱。", "dev_action_url": None}
     else:
         raise HTTPException(status_code=503, detail="用户 ID 分配冲突，请稍后重试")
     db.refresh(user)
-    set_auth_cookies(response, user, request, db)
-    return user
+    dev_action_url = issue_auth_action(
+        db, user, "verify_email", email, "/auth/verify-email", settings.auth_email_token_minutes,
+    )
+    return {"message": "如果资料可用，验证邮件已发送，请检查邮箱。", "dev_action_url": dev_action_url}
+
+
+@app.post("/api/v1/auth/verify-email", response_model=AuthActionOut)
+def verify_email(data: AuthTokenIn, request: Request, db: Session = Depends(get_db)):
+    ensure_public_origin(request)
+    enforce_auth_rate_limit(db, request, "verify_email", token_hash(data.token))
+    action_token = valid_auth_action(db, data.token, "verify_email")
+    user = db.get(User, action_token.user_id)
+    if not user or not user.is_active:
+        raise HTTPException(400, "链接无效、已过期或已经使用")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    user.email_verified_at = now
+    db.execute(update(AuthActionToken).where(
+        AuthActionToken.user_id == user.id,
+        AuthActionToken.purpose == "verify_email",
+        AuthActionToken.used_at.is_(None),
+    ).values(used_at=now))
+    db.commit()
+    return {"message": "邮箱验证成功，现在可以登录。"}
+
+
+@app.post("/api/v1/auth/resend-verification", response_model=AuthActionOut, status_code=202)
+def resend_verification(data: EmailRequestIn, request: Request, db: Session = Depends(get_db)):
+    ensure_public_origin(request)
+    email = str(data.email).strip().lower()
+    enforce_auth_rate_limit(db, request, "resend_verification", email)
+    user = db.scalar(select(User).where(func.lower(User.email) == email, User.is_active.is_(True)))
+    dev_action_url = None
+    if user and user.email_verified_at is None:
+        dev_action_url = issue_auth_action(
+            db, user, "verify_email", user.email, "/auth/verify-email", settings.auth_email_token_minutes,
+        )
+    return {"message": "如果邮箱需要验证，验证邮件会发送到该邮箱。", "dev_action_url": dev_action_url}
+
+
+@app.post("/api/v1/auth/forgot-password", response_model=AuthActionOut, status_code=202)
+def forgot_password(data: EmailRequestIn, request: Request, db: Session = Depends(get_db)):
+    ensure_public_origin(request)
+    email = str(data.email).strip().lower()
+    enforce_auth_rate_limit(db, request, "forgot_password", email)
+    user = db.scalar(select(User).where(func.lower(User.email) == email, User.is_active.is_(True)))
+    dev_action_url = None
+    if user and user.email_verified_at is not None:
+        dev_action_url = issue_auth_action(
+            db, user, "reset_password", user.email, "/auth/reset-password", settings.password_reset_token_minutes,
+        )
+    return {"message": "如果邮箱已注册，密码重置邮件会发送到该邮箱。", "dev_action_url": dev_action_url}
+
+
+@app.post("/api/v1/auth/reset-password", status_code=204)
+def reset_password(data: PasswordResetIn, request: Request, response: Response, db: Session = Depends(get_db)):
+    ensure_public_origin(request)
+    enforce_auth_rate_limit(db, request, "reset_password", token_hash(data.token))
+    action_token = valid_auth_action(db, data.token, "reset_password")
+    user = db.get(User, action_token.user_id)
+    if not user or not user.is_active:
+        raise HTTPException(400, "链接无效、已过期或已经使用")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    user.password_hash = hash_password(data.new_password)
+    db.execute(update(AuthActionToken).where(
+        AuthActionToken.user_id == user.id,
+        AuthActionToken.purpose == "reset_password",
+        AuthActionToken.used_at.is_(None),
+    ).values(used_at=now))
+    db.execute(update(AuthSession).where(
+        AuthSession.user_id == user.id,
+        AuthSession.revoked_at.is_(None),
+    ).values(revoked_at=now, revoked_reason="password_reset"))
+    db.commit()
+    clear_auth_cookies(response)
 
 
 @app.post("/api/v1/auth/refresh", response_model=UserOut)
@@ -426,23 +731,35 @@ def refresh_auth(request: Request, response: Response, db: Session = Depends(get
     ):
         raise HTTPException(status_code=401, detail="登录状态已失效，请重新登录")
     user = db.get(User, auth_session.user_id)
-    if not user or not user.is_active:
+    if not user or not user.is_active or user.email_verified_at is None:
         raise HTTPException(status_code=401, detail="账号不可用")
     set_auth_cookies(response, user, request, db, auth_session)
     return user
 
 
 @app.post("/api/v1/auth/logout", status_code=204)
-def logout(request: Request, response: Response, db: Session = Depends(get_db)):
+def logout(request: Request, response: Response, user: User = Depends(current_user), db: Session = Depends(get_db)):
     ensure_csrf(request)
     _, refresh_cookie = _cookie_names()
     refresh_token = request.cookies.get(refresh_cookie)
     if refresh_token:
         auth_session = db.scalar(select(AuthSession).where(AuthSession.refresh_token_hash == token_hash(refresh_token)))
-        if auth_session and auth_session.revoked_at is None:
-            auth_session.revoked_at = datetime.now(timezone.utc).replace(tzinfo=None)
-            auth_session.revoked_reason = "logout"
-            db.commit()
+    else:
+        auth_session = None
+        access_token = request.cookies.get("__Host-access_token") or request.cookies.get("access_token")
+        if access_token:
+            try:
+                payload = decode_access_token(access_token)
+                auth_session = db.scalar(select(AuthSession).where(
+                    AuthSession.id == int(payload["sid"]),
+                    AuthSession.user_id == int(payload["sub"]),
+                ))
+            except Exception:
+                auth_session = None
+    if auth_session and auth_session.revoked_at is None:
+        auth_session.revoked_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        auth_session.revoked_reason = "logout"
+        db.commit()
     clear_auth_cookies(response)
 
 
@@ -541,19 +858,52 @@ def change_password(data: PasswordChangeIn, request: Request, response: Response
     clear_auth_cookies(response)
 
 
-@app.patch("/api/v1/auth/me/email", response_model=UserOut)
+@app.patch("/api/v1/auth/me/email", response_model=AuthActionOut, status_code=202)
+@app.post("/api/v1/auth/change-email", response_model=AuthActionOut, status_code=202)
 def change_email(data: EmailChangeIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
     ensure_csrf(request)
+    enforce_auth_rate_limit(db, request, "change_email", str(user.id))
     if not verify_password(data.password, user.password_hash):
         raise HTTPException(401, "密码不正确")
     email = str(data.email).strip().lower()
+    if email == user.email.lower():
+        raise HTTPException(422, "新邮箱不能与当前邮箱相同")
     existing = db.scalar(select(User).where(User.email == email, User.id != user.id))
     if existing:
         raise HTTPException(409, "邮箱已经被使用")
-    user.email = email
+    dev_action_url = issue_auth_action(
+        db, user, "change_email", email, "/auth/confirm-email-change", settings.auth_email_token_minutes,
+    )
+    return {"message": "确认邮件已发送，新邮箱将在确认后生效。", "dev_action_url": dev_action_url}
+
+
+@app.post("/api/v1/auth/change-email/confirm", response_model=AuthActionOut)
+def confirm_email_change(data: AuthTokenIn, request: Request, response: Response, db: Session = Depends(get_db)):
+    ensure_public_origin(request)
+    enforce_auth_rate_limit(db, request, "confirm_email_change", token_hash(data.token))
+    action_token = valid_auth_action(db, data.token, "change_email")
+    user = db.get(User, action_token.user_id)
+    target_email = (action_token.target_email or "").strip().lower()
+    if not user or not user.is_active or not target_email:
+        raise HTTPException(400, "链接无效、已过期或已经使用")
+    existing = db.scalar(select(User).where(func.lower(User.email) == target_email, User.id != user.id))
+    if existing:
+        raise HTTPException(409, "邮箱已经被使用，请重新申请修改")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    user.email = target_email
+    user.email_verified_at = now
+    db.execute(update(AuthActionToken).where(
+        AuthActionToken.user_id == user.id,
+        AuthActionToken.purpose == "change_email",
+        AuthActionToken.used_at.is_(None),
+    ).values(used_at=now))
+    db.execute(update(AuthSession).where(
+        AuthSession.user_id == user.id,
+        AuthSession.revoked_at.is_(None),
+    ).values(revoked_at=now, revoked_reason="email_changed"))
     db.commit()
-    db.refresh(user)
-    return user
+    clear_auth_cookies(response)
+    return {"message": "新邮箱已确认，请使用新邮箱重新登录。"}
 
 
 @app.delete("/api/v1/auth/me", status_code=204)
@@ -572,6 +922,10 @@ def delete_account(
         AuthSession.user_id == user.id,
         AuthSession.revoked_at.is_(None),
     ).values(revoked_at=now, revoked_reason="account_deleted"))
+    db.execute(update(ShareLink).where(
+        ShareLink.itinerary_id.in_(select(Itinerary.id).where(Itinerary.user_id == user.id)),
+        ShareLink.revoked_at.is_(None),
+    ).values(revoked_at=now))
     user.public_id = None
     user.is_active = False
     user.deleted_at = now
@@ -580,23 +934,48 @@ def delete_account(
 
 
 @app.get("/api/v1/auth/csrf")
-def csrf(response: Response):
+def csrf(request: Request, response: Response, db: Session = Depends(get_db)):
     token = new_csrf_token()
+    auth_session = None
+    access_token = request.cookies.get("__Host-access_token") or request.cookies.get("access_token")
+    if access_token:
+        try:
+            payload = decode_access_token(access_token)
+            auth_session = db.scalar(select(AuthSession).where(
+                AuthSession.id == int(payload["sid"]),
+                AuthSession.user_id == int(payload["sub"]),
+                AuthSession.revoked_at.is_(None),
+            ))
+        except Exception:
+            auth_session = None
+    if auth_session is None:
+        _, refresh_cookie = _cookie_names()
+        refresh_token = request.cookies.get(refresh_cookie)
+        if refresh_token:
+            auth_session = db.scalar(select(AuthSession).where(
+                AuthSession.refresh_token_hash == token_hash(refresh_token),
+                AuthSession.revoked_at.is_(None),
+            ))
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if auth_session and auth_session.expires_at > now:
+        auth_session.csrf_token_hash = token_hash(token)
+        db.commit()
     response.set_cookie("csrf_token", token, httponly=False, secure=settings.app_base_url.startswith("https://"), samesite="lax", path="/")
     return {"csrf_token": token}
 
 
 @app.get("/api/v1/cities", response_model=list[CityOut])
 def list_cities(db: Session = Depends(get_db)):
-    return list(db.scalars(select(City).order_by(City.id)))
+    return list(db.scalars(select(City).where(City.is_active.is_(True)).order_by(City.id)))
 
 
 @app.get("/api/v1/cities/search", response_model=list[CityOut])
 def search_cities(q: str = Query(default="", min_length=0, max_length=80), db: Session = Depends(get_db)):
     keyword = q.strip()
     if not keyword:
-        return list(db.scalars(select(City).order_by(City.id)))
+        return list(db.scalars(select(City).where(City.is_active.is_(True)).order_by(City.id)))
     return list(db.scalars(select(City).where(
+        City.is_active.is_(True),
         (City.name.contains(keyword)) | (City.slug.contains(keyword))
     ).order_by(City.id)))
 
@@ -604,23 +983,25 @@ def search_cities(q: str = Query(default="", min_length=0, max_length=80), db: S
 @app.get("/api/v1/cities/{city_id}", response_model=CityOut)
 def get_city(city_id: int, db: Session = Depends(get_db)):
     city = db.get(City, city_id)
-    if not city:
+    if not city or not city.is_active:
         raise HTTPException(404, "城市不存在")
     return city
 
 
 @app.get("/api/v1/cities/{city_id}/attractions", response_model=list[AttractionOut])
 def city_attractions(city_id: int, db: Session = Depends(get_db)):
-    if not db.get(City, city_id):
+    city = db.get(City, city_id)
+    if not city or not city.is_active:
         raise HTTPException(404, "城市不存在")
-    attractions = list(db.scalars(select(Attraction).where(Attraction.city_id == city_id)))
+    attractions = list(db.scalars(select(Attraction).where(Attraction.city_id == city_id, Attraction.is_active.is_(True))))
     return sorted(attractions, key=lambda item: (-attraction_hot_score(db, item), item.id))
 
 
 @app.get("/api/v1/attractions/{attraction_id}", response_model=AttractionOut)
 def get_attraction(attraction_id: int, db: Session = Depends(get_db)):
     attraction = db.get(Attraction, attraction_id)
-    if not attraction:
+    city = db.get(City, attraction.city_id) if attraction else None
+    if not attraction or not attraction.is_active or not city or not city.is_active:
         raise HTTPException(404, "景点不存在")
     return attraction
 
@@ -633,7 +1014,7 @@ def list_media_assets(
     include_inactive: bool = False,
     db: Session = Depends(get_db),
 ):
-    query = select(MediaAsset)
+    query = select(MediaAsset).join(City, City.id == MediaAsset.city_id).where(City.is_active.is_(True))
     if city_id is not None:
         query = query.where(MediaAsset.city_id == city_id)
     if attraction_id is not None:
@@ -642,21 +1023,466 @@ def list_media_assets(
         query = query.where(MediaAsset.purpose == purpose)
     if not include_inactive:
         query = query.where(MediaAsset.is_active.is_(True))
+    query = query.where(or_(MediaAsset.attraction_id.is_(None), MediaAsset.attraction_id.in_(
+        select(Attraction.id).where(Attraction.is_active.is_(True))
+    )))
     return list(db.scalars(query.order_by(MediaAsset.city_id, MediaAsset.attraction_id, MediaAsset.id)))
+
+
+@app.get("/api/v1/admin/media-assets", response_model=list[MediaAssetOut])
+def admin_list_media_assets(
+    city_id: int | None = Query(default=None, ge=1),
+    verification_status: str | None = Query(default=None, max_length=30),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    require_admin(user)
+    query = select(MediaAsset)
+    if city_id is not None:
+        query = query.where(MediaAsset.city_id == city_id)
+    if verification_status:
+        query = query.where(MediaAsset.verification_status == verification_status)
+    return list(db.scalars(query.order_by(MediaAsset.city_id, MediaAsset.attraction_id, MediaAsset.id)))
+
+
+@app.post("/api/v1/admin/media-assets/{asset_id}/autofill", response_model=MediaAssetOut)
+def autofill_media_asset(asset_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    asset = db.get(MediaAsset, asset_id)
+    if not asset:
+        raise HTTPException(404, "图片记录不存在")
+    if asset.is_active:
+        raise HTTPException(409, "已启用的图片请先在编辑面板中手动替换，避免自动搜索中断当前展示")
+    city = db.get(City, asset.city_id)
+    attraction = db.get(Attraction, asset.attraction_id) if asset.attraction_id else None
+    if not city:
+        raise HTTPException(409, "图片所属城市不存在")
+    query = f"{attraction.name if attraction else city.name} {city.name} China"
+    candidate = search_commons_image(query)
+    if not candidate:
+        raise HTTPException(404, "未找到可用候选图片，请手动填写图片来源")
+    asset.storage_type = "remote_url"
+    asset.url = candidate["url"]
+    asset.storage_path = None
+    asset.mime_type = candidate["mime_type"]
+    asset.alt_text = candidate["alt_text"]
+    asset.source_name = candidate["source_name"]
+    asset.source_author = candidate["source_author"]
+    asset.license_name = candidate["license_name"]
+    asset.attribution_url = candidate["attribution_url"]
+    asset.verification_status = "needs_review"
+    asset.is_active = False
+    sync_media_display_target(db, asset)
+    record_admin_audit(db, user, "autofill", "media_asset", asset.id, f"自动查找图片候选：{asset.content_key}")
+    db.commit()
+    db.refresh(asset)
+    return asset
+
+
+@app.patch("/api/v1/admin/media-assets/{asset_id}", response_model=MediaAssetOut)
+def update_media_asset(asset_id: int, data: MediaAssetUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    asset = db.get(MediaAsset, asset_id)
+    if not asset:
+        raise HTTPException(404, "图片记录不存在")
+    changes = data.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        setattr(asset, field, value)
+    if asset.storage_type == "remote_url" and not asset.url:
+        raise HTTPException(422, "远程图片必须填写图片地址")
+    if asset.storage_type == "local_file":
+        if not asset.storage_path or asset.storage_path.startswith(("/", "\\")) or ".." in Path(asset.storage_path).parts:
+            raise HTTPException(422, "本地图片路径必须位于 backend/media 目录内")
+        asset.url = media_display_url(asset)
+    if asset.is_active and asset.verification_status != "approved":
+        raise HTTPException(422, "只有已核验图片才能启用展示")
+    sync_media_display_target(db, asset)
+    record_admin_audit(db, user, "update", "media_asset", asset.id, f"修改图片记录：{asset.content_key}", {"fields": sorted(changes)})
+    db.commit()
+    db.refresh(asset)
+    return asset
+
+
+def admin_city_dict(db: Session, city: City) -> dict:
+    return {
+        "id": city.id, "slug": city.slug, "name": city.name, "aliases": city.aliases or [],
+        "description": city.description, "season": city.season, "budget": city.budget,
+        "recommended_days": city.recommended_days, "image_url": city.image_url,
+        "support_level": city.support_level, "planning_enabled": city.planning_enabled, "is_active": city.is_active,
+        "attraction_count": db.scalar(select(func.count(Attraction.id)).where(Attraction.city_id == city.id)) or 0,
+    }
+
+
+def admin_attraction_dict(db: Session, attraction: Attraction) -> dict:
+    city = db.get(City, attraction.city_id)
+    return {
+        "id": attraction.id, "city_id": attraction.city_id, "city_name": city.name if city else "已删除城市",
+        "name": attraction.name, "description": attraction.description, "tags": attraction.tags or [],
+        "opening_hours": attraction.opening_hours, "ticket_price": attraction.ticket_price,
+        "duration_minutes": attraction.duration_minutes, "area": attraction.area,
+        "latitude": attraction.latitude, "longitude": attraction.longitude, "image_url": attraction.image_url,
+        "source": attraction.source, "is_active": attraction.is_active,
+    }
+
+
+@app.get("/api/v1/admin/cities", response_model=list[AdminCityOut])
+def admin_list_cities(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    return [admin_city_dict(db, city) for city in db.scalars(select(City).order_by(City.id))]
+
+
+@app.post("/api/v1/admin/cities", response_model=AdminCityOut, status_code=201)
+def admin_create_city(data: AdminCityCreateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    city = City(**data.model_dump())
+    db.add(city)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "城市英文标识已存在") from exc
+    record_admin_audit(db, user, "create", "city", city.id, f"新增城市：{city.name}", {"slug": city.slug})
+    db.commit()
+    db.refresh(city)
+    return admin_city_dict(db, city)
+
+
+@app.patch("/api/v1/admin/cities/{city_id}", response_model=AdminCityOut)
+def admin_update_city(city_id: int, data: AdminCityUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    city = db.get(City, city_id)
+    if not city:
+        raise HTTPException(404, "城市不存在")
+    changes = data.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        setattr(city, field, value)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "城市英文标识已存在") from exc
+    record_admin_audit(db, user, "update", "city", city.id, f"修改城市：{city.name}", {"fields": sorted(changes)})
+    db.commit()
+    db.refresh(city)
+    return admin_city_dict(db, city)
+
+
+@app.delete("/api/v1/admin/cities/{city_id}", status_code=204)
+def admin_delete_city(city_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    city = db.get(City, city_id)
+    if not city:
+        raise HTTPException(404, "城市不存在")
+    if city.is_active:
+        raise HTTPException(409, "请先停用城市，再执行彻底删除")
+    references = {
+        "景点": db.scalar(select(func.count(Attraction.id)).where(Attraction.city_id == city_id)) or 0,
+        "图片": db.scalar(select(func.count(MediaAsset.id)).where(MediaAsset.city_id == city_id)) or 0,
+        "排行": db.scalar(select(func.count(RankingEntry.id)).where(RankingEntry.city_id == city_id)) or 0,
+        "收藏": db.scalar(select(func.count(Favorite.id)).where(Favorite.target_type == "city", Favorite.target_id == city_id)) or 0,
+        "浏览记录": db.scalar(select(func.count(RecentView.id)).where(RecentView.target_type == "city", RecentView.target_id == city_id)) or 0,
+    }
+    linked = [name for name, count in references.items() if count]
+    if linked:
+        raise HTTPException(409, f"城市仍有关联数据（{'、'.join(linked)}），只能保持停用")
+    name = city.name
+    db.delete(city)
+    record_admin_audit(db, user, "delete", "city", city_id, f"删除城市：{name}")
+    db.commit()
+
+
+@app.post("/api/v1/admin/cities/import")
+def admin_import_cities(data: AdminCityImportIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    slugs = [item.slug for item in data.items]
+    if len(slugs) != len(set(slugs)):
+        raise HTTPException(422, "导入数据中存在重复的城市英文标识")
+    existing = set(db.scalars(select(City.slug).where(City.slug.in_(slugs))))
+    if existing:
+        raise HTTPException(409, f"城市英文标识已存在：{', '.join(sorted(existing))}")
+    cities = [City(**item.model_dump()) for item in data.items]
+    db.add_all(cities)
+    db.flush()
+    record_admin_audit(db, user, "import", "city", None, f"批量导入城市：{len(cities)} 条", {"count": len(cities), "slugs": slugs})
+    db.commit()
+    return {"created": len(cities)}
+
+
+@app.get("/api/v1/admin/attractions", response_model=list[AdminAttractionOut])
+def admin_list_attractions(city_id: int | None = Query(default=None, ge=1), user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    statement = select(Attraction).order_by(Attraction.city_id, Attraction.id)
+    if city_id is not None:
+        statement = statement.where(Attraction.city_id == city_id)
+    return [admin_attraction_dict(db, attraction) for attraction in db.scalars(statement)]
+
+
+@app.post("/api/v1/admin/attractions", response_model=AdminAttractionOut, status_code=201)
+def admin_create_attraction(data: AdminAttractionCreateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    if not db.get(City, data.city_id):
+        raise HTTPException(422, "所属城市不存在")
+    attraction = Attraction(**data.model_dump())
+    db.add(attraction)
+    db.flush()
+    record_admin_audit(db, user, "create", "attraction", attraction.id, f"新增景点：{attraction.name}", {"city_id": attraction.city_id})
+    db.commit()
+    db.refresh(attraction)
+    return admin_attraction_dict(db, attraction)
+
+
+@app.patch("/api/v1/admin/attractions/{attraction_id}", response_model=AdminAttractionOut)
+def admin_update_attraction(attraction_id: int, data: AdminAttractionUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    attraction = db.get(Attraction, attraction_id)
+    if not attraction:
+        raise HTTPException(404, "景点不存在")
+    changes = data.model_dump(exclude_unset=True)
+    if "city_id" in changes and not db.get(City, changes["city_id"]):
+        raise HTTPException(422, "所属城市不存在")
+    for field, value in changes.items():
+        setattr(attraction, field, value)
+    record_admin_audit(db, user, "update", "attraction", attraction.id, f"修改景点：{attraction.name}", {"fields": sorted(changes)})
+    db.commit()
+    db.refresh(attraction)
+    return admin_attraction_dict(db, attraction)
+
+
+@app.delete("/api/v1/admin/attractions/{attraction_id}", status_code=204)
+def admin_delete_attraction(attraction_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    attraction = db.get(Attraction, attraction_id)
+    if not attraction:
+        raise HTTPException(404, "景点不存在")
+    if attraction.is_active:
+        raise HTTPException(409, "请先停用景点，再执行彻底删除")
+    references = {
+        "行程": db.scalar(select(func.count(ItineraryStop.id)).where(ItineraryStop.attraction_id == attraction_id)) or 0,
+        "图片": db.scalar(select(func.count(MediaAsset.id)).where(MediaAsset.attraction_id == attraction_id)) or 0,
+        "排行": db.scalar(select(func.count(RankingEntry.id)).where(RankingEntry.attraction_id == attraction_id)) or 0,
+        "收藏": db.scalar(select(func.count(Favorite.id)).where(Favorite.target_type == "attraction", Favorite.target_id == attraction_id)) or 0,
+        "浏览记录": db.scalar(select(func.count(RecentView.id)).where(RecentView.target_type == "attraction", RecentView.target_id == attraction_id)) or 0,
+    }
+    linked = [name for name, count in references.items() if count]
+    if linked:
+        raise HTTPException(409, f"景点仍有关联数据（{'、'.join(linked)}），只能保持停用")
+    name = attraction.name
+    db.delete(attraction)
+    record_admin_audit(db, user, "delete", "attraction", attraction_id, f"删除景点：{name}")
+    db.commit()
+
+
+@app.post("/api/v1/admin/attractions/import")
+def admin_import_attractions(data: AdminAttractionImportIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    city_ids = {item.city_id for item in data.items}
+    existing_ids = set(db.scalars(select(City.id).where(City.id.in_(city_ids))))
+    if city_ids != existing_ids:
+        raise HTTPException(422, "导入数据中存在不存在的所属城市")
+    attractions = [Attraction(**item.model_dump()) for item in data.items]
+    db.add_all(attractions)
+    db.flush()
+    record_admin_audit(db, user, "import", "attraction", None, f"批量导入景点：{len(attractions)} 条", {"count": len(attractions), "city_ids": sorted(city_ids)})
+    db.commit()
+    return {"created": len(attractions)}
+
+
+def ranking_target(db: Session, ranking_type: str, city_id: int | None, attraction_id: int | None) -> tuple[int | None, int | None, str]:
+    if ranking_type == "city":
+        if city_id is None or attraction_id is not None:
+            raise HTTPException(422, "城市排行必须只选择城市")
+        city = db.get(City, city_id)
+        if not city or not city.is_active:
+            raise HTTPException(422, "排行城市不存在或已停用")
+        return city.id, None, city.name
+    if attraction_id is None or city_id is not None:
+        raise HTTPException(422, "景点排行必须只选择景点")
+    attraction = db.get(Attraction, attraction_id)
+    city = db.get(City, attraction.city_id) if attraction else None
+    if not attraction or not attraction.is_active or not city or not city.is_active:
+        raise HTTPException(422, "排行景点不存在或已停用")
+    return attraction.city_id, attraction.id, attraction.name
+
+
+def ensure_ranking_conflicts_absent(
+    db: Session,
+    ranking_type: str,
+    city_id: int | None,
+    attraction_id: int | None,
+    rank: int,
+    is_active: bool,
+    exclude_id: int | None = None,
+) -> None:
+    target_filter = RankingEntry.city_id == city_id if ranking_type == "city" else RankingEntry.attraction_id == attraction_id
+    target_query = select(RankingEntry.id).where(RankingEntry.ranking_type == ranking_type, target_filter)
+    if exclude_id is not None:
+        target_query = target_query.where(RankingEntry.id != exclude_id)
+    if db.scalar(target_query):
+        raise HTTPException(409, "该对象已有排行记录，请直接编辑")
+    if not is_active:
+        return
+    rank_query = select(RankingEntry.id).where(
+        RankingEntry.ranking_type == ranking_type,
+        RankingEntry.rank == rank,
+        RankingEntry.is_active.is_(True),
+    )
+    if exclude_id is not None:
+        rank_query = rank_query.where(RankingEntry.id != exclude_id)
+    if db.scalar(rank_query):
+        raise HTTPException(409, f"第 {rank} 名已被其他展示中的记录占用")
+
+
+def admin_ranking_dict(db: Session, entry: RankingEntry) -> dict:
+    target = db.get(City, entry.city_id) if entry.ranking_type == "city" else db.get(Attraction, entry.attraction_id)
+    return {"id": entry.id, "ranking_type": entry.ranking_type, "city_id": entry.city_id, "attraction_id": entry.attraction_id, "target_name": target.name if target else "已删除对象", "rank": entry.rank, "score": entry.score, "reason": entry.reason, "is_active": entry.is_active, "created_at": entry.created_at, "updated_at": entry.updated_at}
+
+
+@app.get("/api/v1/admin/rankings", response_model=list[AdminRankingOut])
+def admin_list_rankings(ranking_type: str | None = Query(default=None, pattern="^(city|attraction)$"), user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    statement = select(RankingEntry).order_by(RankingEntry.ranking_type, RankingEntry.rank, RankingEntry.id)
+    if ranking_type:
+        statement = statement.where(RankingEntry.ranking_type == ranking_type)
+    return [admin_ranking_dict(db, entry) for entry in db.scalars(statement)]
+
+
+@app.post("/api/v1/admin/rankings", response_model=AdminRankingOut, status_code=201)
+def admin_create_ranking(data: AdminRankingCreateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    city_id, attraction_id, target_name = ranking_target(db, data.ranking_type, data.city_id, data.attraction_id)
+    ensure_ranking_conflicts_absent(db, data.ranking_type, city_id, attraction_id, data.rank, data.is_active)
+    entry_payload = data.model_dump()
+    entry_payload["city_id"] = city_id
+    entry_payload["attraction_id"] = attraction_id
+    entry = RankingEntry(**entry_payload)
+    db.add(entry)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "该对象已有排行记录，请直接编辑") from exc
+    record_admin_audit(db, user, "create", "ranking", entry.id, f"新增{data.ranking_type}排行：{target_name}", {"rank": entry.rank})
+    db.commit()
+    db.refresh(entry)
+    return admin_ranking_dict(db, entry)
+
+
+@app.patch("/api/v1/admin/rankings/{entry_id}", response_model=AdminRankingOut)
+def admin_update_ranking(entry_id: int, data: AdminRankingUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    entry = db.get(RankingEntry, entry_id)
+    if not entry:
+        raise HTTPException(404, "排行记录不存在")
+    changes = data.model_dump(exclude_unset=True)
+    ensure_ranking_conflicts_absent(
+        db,
+        entry.ranking_type,
+        entry.city_id,
+        entry.attraction_id,
+        changes.get("rank", entry.rank),
+        changes.get("is_active", entry.is_active),
+        exclude_id=entry.id,
+    )
+    for field, value in changes.items():
+        setattr(entry, field, value)
+    record_admin_audit(db, user, "update", "ranking", entry.id, "修改排行记录", {"fields": sorted(changes)})
+    db.commit()
+    db.refresh(entry)
+    return admin_ranking_dict(db, entry)
+
+
+@app.delete("/api/v1/admin/rankings/{entry_id}", status_code=204)
+def admin_delete_ranking(entry_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    entry = db.get(RankingEntry, entry_id)
+    if not entry:
+        raise HTTPException(404, "排行记录不存在")
+    target_name = admin_ranking_dict(db, entry)["target_name"]
+    db.delete(entry)
+    record_admin_audit(db, user, "delete", "ranking", entry_id, f"删除排行记录：{target_name}")
+    db.commit()
+
+
+@app.post("/api/v1/admin/rankings/import")
+def admin_import_rankings(data: AdminRankingImportIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    entries = []
+    seen_targets: set[tuple[str, int | None, int | None]] = set()
+    seen_active_ranks: set[tuple[str, int]] = set()
+    for item in data.items:
+        city_id, attraction_id, _ = ranking_target(db, item.ranking_type, item.city_id, item.attraction_id)
+        key = (item.ranking_type, city_id if item.ranking_type == "city" else None, attraction_id)
+        if key in seen_targets:
+            raise HTTPException(422, "导入数据中存在重复排行对象")
+        seen_targets.add(key)
+        active_rank_key = (item.ranking_type, item.rank)
+        if item.is_active and active_rank_key in seen_active_ranks:
+            raise HTTPException(422, f"导入数据中存在重复的展示名次：{item.ranking_type} 第 {item.rank} 名")
+        if item.is_active:
+            seen_active_ranks.add(active_rank_key)
+        ensure_ranking_conflicts_absent(db, item.ranking_type, city_id, attraction_id, item.rank, item.is_active)
+        entry_payload = item.model_dump()
+        entry_payload["city_id"] = city_id
+        entry_payload["attraction_id"] = attraction_id
+        entries.append(RankingEntry(**entry_payload))
+    db.add_all(entries)
+    db.flush()
+    record_admin_audit(db, user, "import", "ranking", None, f"批量导入排行：{len(entries)} 条", {"count": len(entries)})
+    db.commit()
+    return {"created": len(entries)}
+
+
+@app.get("/api/v1/admin/audit-logs", response_model=AdminAuditLogPageOut)
+def admin_audit_logs(page: int = Query(default=1, ge=1), page_size: int = Query(default=20, ge=10, le=100), user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    total = db.scalar(select(func.count(AdminAuditLog.id))) or 0
+    logs = db.scalars(select(AdminAuditLog).order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc()).offset((page - 1) * page_size).limit(page_size))
+    return {"items": [{"id": item.id, "actor_username": item.actor_username, "action": item.action, "target_type": item.target_type, "target_id": item.target_id, "summary": item.summary, "created_at": item.created_at} for item in logs], "total": total, "page": page, "page_size": page_size}
 
 
 @app.get("/api/v1/rankings")
 def rankings(type: str = "city", city_id: int | None = Query(default=None, ge=1), db: Session = Depends(get_db)):
-    if type == "city":
-        cities = list(db.scalars(select(City).order_by(City.id)))
-        return [{"rank": index + 1, "name": city.name, "score": 96 - index * 4, "reason": city.season} for index, city in enumerate(cities)]
-    if type != "attraction":
+    if type not in {"city", "attraction"}:
         raise HTTPException(status_code=400, detail="排行类型必须是 city 或 attraction")
+    manual_query = select(RankingEntry).where(RankingEntry.ranking_type == type, RankingEntry.is_active.is_(True))
+    if type == "attraction" and city_id is not None:
+        city = db.get(City, city_id)
+        if not city or not city.is_active:
+            raise HTTPException(status_code=404, detail="城市不存在")
+        manual_query = manual_query.where(RankingEntry.city_id == city_id)
+    manual_entries = list(db.scalars(manual_query.order_by(RankingEntry.rank, RankingEntry.id)))
+    if manual_entries:
+        results = []
+        for entry in manual_entries:
+            target = db.get(City, entry.city_id) if entry.ranking_type == "city" else db.get(Attraction, entry.attraction_id)
+            target_city = target if isinstance(target, City) else db.get(City, target.city_id) if target else None
+            if target and target.is_active and target_city and target_city.is_active:
+                results.append({"rank": entry.rank, "city_id": entry.city_id, "attraction_id": entry.attraction_id, "name": target.name, "score": entry.score, "reason": entry.reason, "data_source": "admin_curated"})
+        return results
+    if type == "city":
+        cities = list(db.scalars(select(City).where(City.is_active.is_(True)).order_by(City.id)))
+        return [{"rank": index + 1, "name": city.name, "score": 96 - index * 4, "reason": city.season} for index, city in enumerate(cities)]
     query = select(Attraction)
     if city_id is not None:
-        if not db.get(City, city_id):
+        city = db.get(City, city_id)
+        if not city or not city.is_active:
             raise HTTPException(status_code=404, detail="城市不存在")
         query = query.where(Attraction.city_id == city_id)
+    query = query.join(City, City.id == Attraction.city_id).where(Attraction.is_active.is_(True), City.is_active.is_(True))
     attractions = list(db.scalars(query.order_by(Attraction.id)))
     scored = sorted(
         ((attraction, attraction_hot_score(db, attraction)) for attraction in attractions),
@@ -699,6 +1525,7 @@ def attraction_hot_score(db: Session, attraction: Attraction) -> int:
 
 
 DEFAULT_SESSION_TITLE = "新的旅行规划"
+BULK_SESSION_DELETE_PASSWORD_THRESHOLD = 3
 
 
 def session_title_from_message(content: str) -> str:
@@ -793,6 +1620,53 @@ def delete_session(session_id: int, request: Request, user: User = Depends(curre
     db.commit()
 
 
+@app.post("/api/v1/sessions/bulk")
+def bulk_update_sessions(
+    data: SessionBulkUpdateIn,
+    request: Request,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    ensure_csrf(request)
+    session_ids = list(dict.fromkeys(data.session_ids))
+    if len(session_ids) != len(data.session_ids):
+        raise HTTPException(422, "会话不能重复选择")
+    sessions_to_update = list(db.scalars(
+        select(ChatSession).where(
+            ChatSession.id.in_(session_ids),
+            ChatSession.user_id == user.id,
+            ChatSession.deleted_at.is_(None),
+        )
+    ))
+    if len(sessions_to_update) != len(session_ids):
+        raise HTTPException(404, "会话不存在或无权操作")
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if data.action == "delete":
+        if len(sessions_to_update) >= BULK_SESSION_DELETE_PASSWORD_THRESHOLD:
+            if not data.password or not verify_password(data.password, user.password_hash):
+                raise HTTPException(403, "请验证当前账号密码后删除多条会话")
+        active_job = db.scalar(select(PlanningJob.id).where(
+            PlanningJob.session_id.in_(session_ids),
+            PlanningJob.status.in_(["queued", "running"]),
+        ))
+        if active_job:
+            raise HTTPException(409, "所选会话仍有任务正在处理，请先停止任务")
+        for chat_session in sessions_to_update:
+            chat_session.deleted_at = now
+            chat_session.is_pinned = False
+            chat_session.updated_at = now
+    else:
+        archived_at = now if data.action == "archive" else None
+        for chat_session in sessions_to_update:
+            chat_session.archived_at = archived_at
+            if archived_at:
+                chat_session.is_pinned = False
+            chat_session.updated_at = now
+    db.commit()
+    return {"processed_count": len(sessions_to_update), "action": data.action}
+
+
 @app.get("/api/v1/sessions/{session_id}/messages", response_model=list[MessageOut])
 def session_messages(session_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     owned_session(db, user, session_id)
@@ -871,7 +1745,7 @@ async def plan_confirm(
     destination_city_id = allowed_patch.get("destination_city_id")
     if destination_city_id:
         city = db.get(City, destination_city_id)
-        if not city or city.support_level != "full" or not city.planning_enabled:
+        if not city or not city.is_active or city.support_level != "full" or not city.planning_enabled:
             raise HTTPException(status_code=422, detail="所选城市暂不支持完整行程规划")
         allowed_patch["destination"] = city.name
     if "interests" in allowed_patch:
@@ -985,25 +1859,312 @@ def planning_job(job_id: int, user: User = Depends(current_user), db: Session = 
     return {"id": job.id, "status": job.status, "stage": job.stage, "result_itinerary_id": job.result_itinerary_id, "error_message": job.error_message}
 
 
+def optional_current_user(request: Request, db: Session = Depends(get_db)) -> User | None:
+    try:
+        return current_user(request, db)
+    except HTTPException:
+        return None
+
+
+def public_itinerary_snapshot(db: Session, itinerary_id: int) -> dict:
+    itinerary = itinerary_dict(db, itinerary_id) or {}
+    return {
+        "title": itinerary.get("title", ""),
+        "city_name": itinerary.get("city_name", ""),
+        "days": itinerary.get("days", 0),
+        "budget_total": itinerary.get("budget_total", 0),
+        "preferences": itinerary.get("preferences", []),
+        "itinerary_days": [{
+            "day_number": day.get("day_number"),
+            "title": day.get("title", ""),
+            "stops": [{
+                "name": stop.get("name", ""),
+                "start_time": stop.get("start_time", ""),
+                "end_time": stop.get("end_time", ""),
+            } for stop in day.get("stops", [])],
+        } for day in itinerary.get("itinerary_days", [])],
+    }
+
+
+def community_author_name(db: Session, user_id: int) -> str:
+    profile = db.scalar(select(UserProfile).where(UserProfile.user_id == user_id))
+    user = db.get(User, user_id)
+    return (profile.display_name if profile and profile.display_name else user.username) if user else "旅行者"
+
+
+def community_post_dict(db: Session, post: CommunityPost, viewer: User | None = None, include_comments: bool = False) -> dict:
+    images = list(db.scalars(select(CommunityPostImage).where(
+        CommunityPostImage.post_id == post.id,
+        CommunityPostImage.status == "published",
+    ).order_by(CommunityPostImage.sort_order)))
+    comment_query = select(CommunityComment).where(
+        CommunityComment.post_id == post.id,
+        CommunityComment.status == "published",
+    ).order_by(CommunityComment.created_at.asc(), CommunityComment.id.asc())
+    comments = list(db.scalars(comment_query.limit(100))) if include_comments else []
+    values = {
+        "id": post.id,
+        "title": post.title,
+        "body": post.body,
+        "city_name": post.city_name,
+        "status": post.status,
+        "created_at": post.created_at,
+        "updated_at": post.updated_at,
+        "author": {"id": post.author_id, "name": community_author_name(db, post.author_id)},
+        "itinerary": post.itinerary_snapshot,
+        "images": [{"id": image.id, "url": f"/media/{image.storage_path}", "alt_text": image.alt_text} for image in images],
+        "like_count": db.scalar(select(func.count(CommunityPostLike.id)).where(CommunityPostLike.post_id == post.id)) or 0,
+        "favorite_count": db.scalar(select(func.count(CommunityPostFavorite.id)).where(CommunityPostFavorite.post_id == post.id)) or 0,
+        "comment_count": db.scalar(select(func.count(CommunityComment.id)).where(CommunityComment.post_id == post.id, CommunityComment.status == "published")) or 0,
+        "liked": bool(viewer and db.scalar(select(CommunityPostLike.id).where(CommunityPostLike.post_id == post.id, CommunityPostLike.user_id == viewer.id))),
+        "favorited": bool(viewer and db.scalar(select(CommunityPostFavorite.id).where(CommunityPostFavorite.post_id == post.id, CommunityPostFavorite.user_id == viewer.id))),
+        "can_manage": bool(viewer and (viewer.id == post.author_id or viewer.role == "admin")),
+    }
+    if include_comments:
+        values["comments"] = [{
+            "id": comment.id,
+            "body": comment.body,
+            "created_at": comment.created_at,
+            "author": {"id": comment.author_id, "name": community_author_name(db, comment.author_id)},
+            "can_manage": bool(viewer and (viewer.id == comment.author_id or viewer.role == "admin")),
+        } for comment in comments]
+    return values
+
+
+def published_community_post(db: Session, post_id: int) -> CommunityPost:
+    post = db.get(CommunityPost, post_id)
+    if not post or post.status != "published":
+        raise HTTPException(404, "社区帖子不存在")
+    return post
+
+
+@app.get("/api/v1/community/posts")
+def list_community_posts(
+    city: str = Query(default="", max_length=80),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=12, ge=1, le=24),
+    viewer: User | None = Depends(optional_current_user),
+    db: Session = Depends(get_db),
+):
+    filters = [CommunityPost.status == "published"]
+    if city.strip():
+        filters.append(CommunityPost.city_name == city.strip())
+    total = db.scalar(select(func.count(CommunityPost.id)).where(*filters)) or 0
+    posts = list(db.scalars(select(CommunityPost).where(*filters).order_by(
+        CommunityPost.created_at.desc(), CommunityPost.id.desc()
+    ).offset((page - 1) * page_size).limit(page_size)))
+    return {"items": [community_post_dict(db, post, viewer) for post in posts], "total": total, "page": page, "page_size": page_size}
+
+
+@app.get("/api/v1/community/posts/{post_id}")
+def get_community_post(post_id: int, viewer: User | None = Depends(optional_current_user), db: Session = Depends(get_db)):
+    return community_post_dict(db, published_community_post(db, post_id), viewer, include_comments=True)
+
+
+@app.get("/api/v1/community/me/posts")
+def list_my_community_posts(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    posts = db.scalars(select(CommunityPost).where(CommunityPost.author_id == user.id).order_by(CommunityPost.created_at.desc(), CommunityPost.id.desc()))
+    return [community_post_dict(db, post, user) for post in posts]
+
+
+@app.post("/api/v1/community/posts", status_code=201)
+def create_community_post(data: CommunityPostCreateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ensure_csrf(request)
+    itinerary = itinerary_for_user(data.itinerary_id, user, db)
+    if itinerary.status != "saved":
+        raise HTTPException(409, "请先保存行程再发布到社区")
+    post = CommunityPost(
+        author_id=user.id,
+        itinerary_id=itinerary.id,
+        itinerary_snapshot=public_itinerary_snapshot(db, itinerary.id),
+        city_name=itinerary.city_name,
+        title=data.title.strip(),
+        body=data.body.strip(),
+    )
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return community_post_dict(db, post, user)
+
+
+@app.patch("/api/v1/community/posts/{post_id}")
+def update_community_post(post_id: int, data: CommunityPostUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ensure_csrf(request)
+    post = db.get(CommunityPost, post_id)
+    if not post or post.author_id != user.id:
+        raise HTTPException(404, "社区帖子不存在")
+    post.title = data.title.strip()
+    post.body = data.body.strip()
+    db.commit()
+    db.refresh(post)
+    return community_post_dict(db, post, user)
+
+
+@app.delete("/api/v1/community/posts/{post_id}", status_code=204)
+def withdraw_community_post(post_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ensure_csrf(request)
+    post = db.get(CommunityPost, post_id)
+    if not post or post.author_id != user.id:
+        raise HTTPException(404, "社区帖子不存在")
+    post.status = "hidden"
+    db.commit()
+
+
+def image_type_from_bytes(content: bytes) -> tuple[str, str] | None:
+    if content.startswith(b"\xff\xd8\xff"):
+        return ("image/jpeg", ".jpg")
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ("image/png", ".png")
+    if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return ("image/webp", ".webp")
+    return None
+
+
+@app.post("/api/v1/community/posts/{post_id}/images")
+async def upload_community_images(
+    post_id: int,
+    request: Request,
+    files: list[UploadFile] = File(...),
+    alt_texts: list[str] = Form(default=[]),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    ensure_csrf(request)
+    post = db.get(CommunityPost, post_id)
+    if not post or post.author_id != user.id or post.status != "published":
+        raise HTTPException(404, "社区帖子不存在")
+    existing_count = db.scalar(select(func.count(CommunityPostImage.id)).where(CommunityPostImage.post_id == post_id)) or 0
+    if not files or existing_count + len(files) > 9:
+        raise HTTPException(422, "每篇帖子最多上传 9 张照片")
+    saved_images = []
+    community_root = MEDIA_ROOT / "community"
+    community_root.mkdir(parents=True, exist_ok=True)
+    for index, upload in enumerate(files):
+        content = await upload.read(8 * 1024 * 1024 + 1)
+        detected = image_type_from_bytes(content)
+        if len(content) > 8 * 1024 * 1024 or not detected:
+            raise HTTPException(422, "照片仅支持 JPEG、PNG 或 WebP，且单张不能超过 8MB")
+        mime_type, suffix = detected
+        storage_path = f"community/{uuid.uuid4().hex}{suffix}"
+        (MEDIA_ROOT / storage_path).write_bytes(content)
+        saved_images.append(CommunityPostImage(
+            post_id=post_id,
+            storage_path=storage_path,
+            mime_type=mime_type,
+            alt_text=(alt_texts[index].strip() if index < len(alt_texts) else "")[:240],
+            sort_order=existing_count + index,
+        ))
+    db.add_all(saved_images)
+    db.commit()
+    return [{"id": image.id, "url": f"/media/{image.storage_path}", "alt_text": image.alt_text} for image in saved_images]
+
+
+@app.put("/api/v1/community/posts/{post_id}/like")
+def like_community_post(post_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ensure_csrf(request)
+    published_community_post(db, post_id)
+    if not db.scalar(select(CommunityPostLike).where(CommunityPostLike.post_id == post_id, CommunityPostLike.user_id == user.id)):
+        db.add(CommunityPostLike(post_id=post_id, user_id=user.id))
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+    return {"ok": True}
+
+
+@app.delete("/api/v1/community/posts/{post_id}/like", status_code=204)
+def unlike_community_post(post_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ensure_csrf(request)
+    item = db.scalar(select(CommunityPostLike).where(CommunityPostLike.post_id == post_id, CommunityPostLike.user_id == user.id))
+    if item:
+        db.delete(item)
+        db.commit()
+
+
+@app.put("/api/v1/community/posts/{post_id}/favorite")
+def favorite_community_post(post_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ensure_csrf(request)
+    published_community_post(db, post_id)
+    if not db.scalar(select(CommunityPostFavorite).where(CommunityPostFavorite.post_id == post_id, CommunityPostFavorite.user_id == user.id)):
+        db.add(CommunityPostFavorite(post_id=post_id, user_id=user.id))
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+    return {"ok": True}
+
+
+@app.delete("/api/v1/community/posts/{post_id}/favorite", status_code=204)
+def unfavorite_community_post(post_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ensure_csrf(request)
+    item = db.scalar(select(CommunityPostFavorite).where(CommunityPostFavorite.post_id == post_id, CommunityPostFavorite.user_id == user.id))
+    if item:
+        db.delete(item)
+        db.commit()
+
+
+@app.post("/api/v1/community/posts/{post_id}/comments", status_code=201)
+def create_community_comment(post_id: int, data: CommunityCommentCreateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ensure_csrf(request)
+    published_community_post(db, post_id)
+    comment = CommunityComment(post_id=post_id, author_id=user.id, body=data.body.strip())
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return {"id": comment.id, "body": comment.body, "created_at": comment.created_at, "author": {"id": user.id, "name": community_author_name(db, user.id)}, "can_manage": True}
+
+
+@app.post("/api/v1/community/reports", status_code=201)
+def create_content_report(data: ContentReportCreateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    ensure_csrf(request)
+    models = {"post": CommunityPost, "comment": CommunityComment, "image": CommunityPostImage}
+    if not db.get(models[data.target_type], data.target_id):
+        raise HTTPException(404, "举报对象不存在")
+    report = ContentReport(reporter_id=user.id, target_type=data.target_type, target_id=data.target_id, reason=data.reason.strip())
+    db.add(report)
+    db.commit()
+    return {"id": report.id, "status": report.status}
+
+
 @app.get("/api/v1/itineraries")
 def list_itineraries(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return [itinerary_dict(db, itinerary.id) for itinerary in db.scalars(select(Itinerary).where(Itinerary.user_id == user.id).order_by(Itinerary.id.desc()))]
+    return [itinerary_dict(db, itinerary.id) for itinerary in db.scalars(select(Itinerary).where(Itinerary.user_id == user.id, Itinerary.deleted_at.is_(None)).order_by(Itinerary.id.desc()))]
 
 
 @app.get("/api/v1/itineraries/{itinerary_id}")
 def get_itinerary(itinerary_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    itinerary = db.get(Itinerary, itinerary_id)
-    if not itinerary or itinerary.user_id != user.id:
-        raise HTTPException(404, "行程不存在")
+    itinerary_for_user(itinerary_id, user, db)
     return itinerary_dict(db, itinerary_id)
+
+
+@app.get("/api/v1/itineraries/{itinerary_id}/agent-run")
+def latest_itinerary_agent_run(itinerary_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    itinerary_for_user(itinerary_id, user, db)
+    run = db.scalar(select(AgentRun).where(AgentRun.itinerary_id == itinerary_id).order_by(AgentRun.id.desc()))
+    if not run:
+        raise HTTPException(404, "该行程没有可展示的 Agent 执行记录")
+    calls = list(db.scalars(select(AgentToolCall).where(AgentToolCall.agent_run_id == run.id).order_by(AgentToolCall.sequence)))
+    return {
+        "id": run.id,
+        "status": run.status,
+        "algorithm_version": run.algorithm_version,
+        "input": run.input_data,
+        "summary": run.summary,
+        "created_at": run.created_at,
+        "steps": [{
+            "sequence": call.sequence,
+            "tool_name": call.tool_name,
+            "input": call.input_data,
+            "output": call.output_data,
+            "status": call.status,
+        } for call in calls],
+    }
 
 
 @app.patch("/api/v1/itineraries/{itinerary_id}")
 def save_itinerary(itinerary_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
     ensure_csrf(request)
-    itinerary = db.get(Itinerary, itinerary_id)
-    if not itinerary or itinerary.user_id != user.id:
-        raise HTTPException(404, "行程不存在")
+    itinerary = itinerary_for_user(itinerary_id, user, db)
     if itinerary.status != "saved":
         itinerary.status = "saved"
         itinerary.lock_version += 1
@@ -1017,16 +2178,24 @@ def delete_itinerary(itinerary_id: int, request: Request, user: User = Depends(c
     itinerary = db.get(Itinerary, itinerary_id)
     if not itinerary or itinerary.user_id != user.id:
         raise HTTPException(404, "行程不存在")
-    validation = db.scalar(select(ItineraryValidation).where(ItineraryValidation.itinerary_id == itinerary_id))
-    if validation:
-        db.delete(validation)
-    db.delete(itinerary)
+    if itinerary.deleted_at is not None:
+        return
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    itinerary.deleted_at = now
+    db.execute(update(ShareLink).where(
+        ShareLink.itinerary_id == itinerary_id,
+        ShareLink.revoked_at.is_(None),
+    ).values(revoked_at=now))
+    db.execute(update(PlanningJob).where(
+        PlanningJob.result_itinerary_id == itinerary_id,
+        PlanningJob.status.in_(["queued", "running"]),
+    ).values(status="cancelled", stage="cancelled", error_message="关联行程已删除", updated_at=now))
     db.commit()
 
 
 def itinerary_for_user(itinerary_id: int, user: User, db: Session) -> Itinerary:
     itinerary = db.get(Itinerary, itinerary_id)
-    if not itinerary or itinerary.user_id != user.id:
+    if not itinerary or itinerary.user_id != user.id or itinerary.deleted_at is not None:
         raise HTTPException(404, "行程不存在")
     return itinerary
 
@@ -1036,7 +2205,62 @@ def save_itinerary_revision(db: Session, itinerary_id: int, snapshot: dict, reas
     db.add(ItineraryRevision(itinerary_id=itinerary_id, version_no=latest + 1, snapshot=snapshot, reason=reason))
 
 
+def validate_itinerary_days(db: Session, itinerary: Itinerary, day_data: list[dict]) -> list[dict]:
+    if not day_data:
+        raise HTTPException(422, "行程至少需要保留一天")
+
+    day_numbers = [item["day_number"] for item in day_data]
+    if sorted(day_numbers) != list(range(1, len(day_data) + 1)):
+        raise HTTPException(422, "行程日期编号必须从第 1 天连续排列")
+
+    city = db.scalar(select(City).where(City.name == itinerary.city_name))
+    if not city:
+        raise HTTPException(409, "行程所属城市资料不存在，无法校验景点")
+
+    attraction_ids = {
+        stop["attraction_id"]
+        for day in day_data
+        for stop in day.get("stops", [])
+        if stop.get("attraction_id") is not None
+    }
+    attractions = {
+        attraction.id: attraction
+        for attraction in db.scalars(select(Attraction).where(Attraction.id.in_(attraction_ids)))
+    }
+    used_attractions: set[int] = set()
+
+    for day in day_data:
+        intervals: list[tuple[datetime, datetime]] = []
+        for stop in day.get("stops", []):
+            attraction_id = stop.get("attraction_id")
+            if attraction_id is not None:
+                attraction = attractions.get(attraction_id)
+                if not attraction or attraction.city_id != city.id:
+                    raise HTTPException(422, f"景点不属于行程城市：{stop.get('name', '未命名景点')}")
+                if attraction_id in used_attractions:
+                    raise HTTPException(422, f"景点不能重复安排：{attraction.name}")
+                used_attractions.add(attraction_id)
+                # The database is the source of truth for names after ID validation.
+                stop["name"] = attraction.name
+
+            try:
+                start = datetime.strptime(stop["start_time"], "%H:%M")
+                end = datetime.strptime(stop["end_time"], "%H:%M")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(422, "景点时间必须使用 HH:MM 格式") from exc
+            if start >= end:
+                raise HTTPException(422, "景点开始时间必须早于结束时间")
+            if any(start < previous_end and previous_start < end for previous_start, previous_end in intervals):
+                raise HTTPException(422, f"第 {day['day_number']} 天存在重叠的景点时间")
+            intervals.append((start, end))
+            stop["start_time"] = start.strftime("%H:%M")
+            stop["end_time"] = end.strftime("%H:%M")
+
+    return day_data
+
+
 def replace_itinerary_days(db: Session, itinerary: Itinerary, day_data: list[dict]) -> None:
+    day_data = validate_itinerary_days(db, itinerary, day_data)
     for day in list(itinerary.itinerary_days):
         for stop in list(day.stops):
             db.delete(stop)
@@ -1058,6 +2282,50 @@ def edit_itinerary(itinerary_id: int, data: ItineraryUpdateIn, request: Request,
     if data.expected_version is not None and data.expected_version != itinerary.lock_version:
         raise HTTPException(409, "行程已被其他页面更新，请刷新后再保存")
     snapshot = itinerary_dict(db, itinerary_id) or {}
+    structured_actions = []
+    if structured_actions:
+        city = db.scalar(select(City).where(City.name == itinerary.city_name))
+        if not city:
+            raise HTTPException(409, "行程所属城市资料不存在，无法校验")
+        for action in structured_actions:
+            if action.type == "set_days":
+                if action.value is None or not 1 <= action.value <= 10:
+                    raise HTTPException(422, "set_days 必须提供 1 到 10 的 value")
+                current_days = snapshot.get("itinerary_days", [])
+                while len(current_days) < action.value:
+                    number = len(current_days) + 1
+                    current_days.append({"day_number": number, "title": f"第{number}天 · {itinerary.city_name}探索", "stops": []})
+                snapshot["itinerary_days"] = current_days[:action.value]
+            elif action.type == "set_budget":
+                if action.value is None:
+                    raise HTTPException(422, "set_budget 必须提供 value")
+                snapshot["budget_total"] = action.value
+            elif action.type == "remove_attraction":
+                if action.attraction_id is None:
+                    raise HTTPException(422, "remove_attraction 必须提供 attraction_id")
+                found = False
+                for day in snapshot.get("itinerary_days", []):
+                    before = len(day.get("stops", []))
+                    day["stops"] = [stop for stop in day.get("stops", []) if stop.get("attraction_id") != action.attraction_id]
+                    found = found or len(day["stops"]) != before
+                if not found:
+                    raise HTTPException(422, "要删除的景点不在当前行程中")
+            elif action.type == "replace_attraction":
+                if action.attraction_id is None or action.new_attraction_id is None:
+                    raise HTTPException(422, "replace_attraction 必须提供 attraction_id 和 new_attraction_id")
+                replacement = db.get(Attraction, action.new_attraction_id)
+                if not replacement or not replacement.is_active or replacement.city_id != city.id:
+                    raise HTTPException(422, "替换景点必须属于当前行程城市")
+                found = False
+                for day in snapshot.get("itinerary_days", []):
+                    for stop in day.get("stops", []):
+                        if stop.get("attraction_id") == action.attraction_id:
+                            stop["attraction_id"] = replacement.id
+                            stop["name"] = replacement.name
+                            stop["note"] = f"{replacement.area} · 建议游览{replacement.duration_minutes}分钟 · 开放时间{replacement.opening_hours}"
+                            found = True
+                if not found:
+                    raise HTTPException(422, "要替换的景点不在当前行程中")
     if data.title is not None:
         itinerary.title = data.title.strip()
     if data.days is not None:
@@ -1089,6 +2357,16 @@ def restore_itinerary_revision(itinerary_id: int, version_no: int, request: Requ
     revision = db.scalar(select(ItineraryRevision).where(ItineraryRevision.itinerary_id == itinerary_id, ItineraryRevision.version_no == version_no))
     if not revision:
         raise HTTPException(404, "历史版本不存在")
+    if False:
+        attraction_ids = {
+            stop.get("attraction_id")
+            for day in snapshot.get("itinerary_days", [])
+            for stop in day.get("stops", [])
+            if stop.get("attraction_id") is not None
+        }
+        total_ticket = sum(item.ticket_price for item in db.scalars(select(Attraction).where(Attraction.id.in_(attraction_ids))))
+        if snapshot.get("budget_total") is not None and total_ticket > snapshot["budget_total"]:
+            raise HTTPException(422, f"调整后门票估算 ¥{total_ticket} 超出预算 ¥{snapshot['budget_total']}")
     current = itinerary_dict(db, itinerary_id) or {}
     save_itinerary_revision(db, itinerary.id, current, "恢复前自动保存")
     snapshot = revision.snapshot
@@ -1102,6 +2380,54 @@ def restore_itinerary_revision(itinerary_id: int, version_no: int, request: Requ
     return itinerary_dict(db, itinerary_id)
 
 
+def apply_structured_replan_actions(db: Session, itinerary: Itinerary, snapshot: dict, actions: list) -> None:
+    """Execute schema-validated operations, then enforce the same database constraints as manual edits."""
+    city = db.scalar(select(City).where(City.name == itinerary.city_name))
+    if not city:
+        raise HTTPException(409, "行程所属城市资料不存在，无法校验")
+    for action in actions:
+        if action.type == "set_days":
+            if action.value is None or not 1 <= action.value <= 10:
+                raise HTTPException(422, "set_days 必须提供 1 到 10 的 value")
+            current_days = snapshot.get("itinerary_days", [])
+            while len(current_days) < action.value:
+                number = len(current_days) + 1
+                current_days.append({"day_number": number, "title": f"第{number}天 · {itinerary.city_name}探索", "stops": []})
+            snapshot["itinerary_days"] = current_days[:action.value]
+        elif action.type == "set_budget":
+            if action.value is None:
+                raise HTTPException(422, "set_budget 必须提供 value")
+            snapshot["budget_total"] = action.value
+        elif action.type == "remove_attraction":
+            if action.attraction_id is None:
+                raise HTTPException(422, "remove_attraction 必须提供 attraction_id")
+            found = False
+            for day in snapshot.get("itinerary_days", []):
+                before = len(day.get("stops", []))
+                day["stops"] = [stop for stop in day.get("stops", []) if stop.get("attraction_id") != action.attraction_id]
+                found = found or len(day["stops"]) != before
+            if not found:
+                raise HTTPException(422, "要删除的景点不在当前行程中")
+        elif action.type == "replace_attraction":
+            if action.attraction_id is None or action.new_attraction_id is None:
+                raise HTTPException(422, "replace_attraction 必须提供 attraction_id 和 new_attraction_id")
+            replacement = db.get(Attraction, action.new_attraction_id)
+            if not replacement or not replacement.is_active or replacement.city_id != city.id:
+                raise HTTPException(422, "替换景点必须属于当前行程城市")
+            found = False
+            for day in snapshot.get("itinerary_days", []):
+                for stop in day.get("stops", []):
+                    if stop.get("attraction_id") == action.attraction_id:
+                        stop.update(attraction_id=replacement.id, name=replacement.name, note=f"{replacement.area} · 建议游览{replacement.duration_minutes}分钟 · 开放时间{replacement.opening_hours}")
+                        found = True
+            if not found:
+                raise HTTPException(422, "要替换的景点不在当前行程中")
+    attraction_ids = {stop.get("attraction_id") for day in snapshot.get("itinerary_days", []) for stop in day.get("stops", []) if stop.get("attraction_id") is not None}
+    total_ticket = sum(item.ticket_price for item in db.scalars(select(Attraction).where(Attraction.id.in_(attraction_ids))))
+    if snapshot.get("budget_total") is not None and total_ticket > snapshot["budget_total"]:
+        raise HTTPException(422, f"调整后门票估算 ¥{total_ticket} 超出预算 ¥{snapshot['budget_total']}")
+
+
 @app.post("/api/v1/itineraries/{itinerary_id}/replan", response_model=dict)
 def replan_itinerary(itinerary_id: int, data: ReplanIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
     """Apply safe, explicit natural-language edits locally; full LLM re-planning remains a later integration."""
@@ -1109,6 +2435,9 @@ def replan_itinerary(itinerary_id: int, data: ReplanIn, request: Request, user: 
     itinerary = itinerary_for_user(itinerary_id, user, db)
     instruction = data.instruction.strip()
     snapshot = itinerary_dict(db, itinerary_id) or {}
+    structured_actions = list(data.actions)
+    if structured_actions:
+        apply_structured_replan_actions(db, itinerary, snapshot, structured_actions)
     day_match = re.search(r"(?:改成|调整为|安排为)\s*(\d+)\s*[天日]", instruction)
     budget_match = re.search(r"预算[^\d]{0,8}(\d{2,7})", instruction)
     delete_match = re.search(r"(?:删除|去掉|不要)[^，。；;]*?([\u4e00-\u9fff]{2,20})", instruction)
@@ -1128,14 +2457,14 @@ def replan_itinerary(itinerary_id: int, data: ReplanIn, request: Request, user: 
             day["stops"] = [stop for stop in day.get("stops", []) if keyword not in stop.get("name", "")]
     if replacement_match:
         old_name, new_name = replacement_match.groups()
-        replacement = db.scalar(select(Attraction).where(Attraction.city_id == db.scalar(select(City.id).where(City.name == itinerary.city_name)), Attraction.name.contains(new_name.strip())))
+        replacement = db.scalar(select(Attraction).where(Attraction.city_id == db.scalar(select(City.id).where(City.name == itinerary.city_name)), Attraction.is_active.is_(True), Attraction.name.contains(new_name.strip())))
         for day in snapshot.get("itinerary_days", []):
             for stop in day.get("stops", []):
                 if old_name.strip() in stop.get("name", "") and replacement:
                     stop["attraction_id"] = replacement.id
                     stop["name"] = replacement.name
                     stop["note"] = f"{replacement.area} · 建议游览{replacement.duration_minutes}分钟 · 开放时间{replacement.opening_hours}"
-    if not any([day_match, budget_match, delete_match, replacement_match]):
+    if not structured_actions and not any([day_match, budget_match, delete_match, replacement_match]):
         raise HTTPException(422, "请说明要调整的天数、预算、景点删除或替换内容")
     current = itinerary_dict(db, itinerary_id) or {}
     save_itinerary_revision(db, itinerary.id, current, "自然语言调整前自动保存")
@@ -1145,6 +2474,7 @@ def replan_itinerary(itinerary_id: int, data: ReplanIn, request: Request, user: 
     itinerary.lock_version += 1
     itinerary.status = "saved"
     db.commit()
+    db.expire_all()
     return itinerary_dict(db, itinerary_id)
 
 
@@ -1175,7 +2505,9 @@ def save_itinerary_feedback(itinerary_id: int, data: FeedbackIn, request: Reques
 @app.post("/api/v1/itineraries/{itinerary_id}/shares", response_model=ShareOut)
 def create_share(itinerary_id: int, data: ShareCreateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
     ensure_csrf(request)
-    itinerary_for_user(itinerary_id, user, db)
+    itinerary = itinerary_for_user(itinerary_id, user, db)
+    if itinerary.status != "saved":
+        raise HTTPException(409, "请先保存行程再创建分享链接")
     raw_token = secrets.token_urlsafe(32)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     share = ShareLink(itinerary_id=itinerary_id, token_hash=token_hash(raw_token), expires_at=now + timedelta(days=data.expires_days))
@@ -1190,6 +2522,10 @@ def read_share(token: str, db: Session = Depends(get_db)):
     share = db.scalar(select(ShareLink).where(ShareLink.token_hash == token_hash(token), ShareLink.revoked_at.is_(None)))
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     if not share or share.expires_at <= now:
+        raise HTTPException(404, "分享链接不存在或已失效")
+    itinerary = db.get(Itinerary, share.itinerary_id)
+    owner = db.get(User, itinerary.user_id) if itinerary else None
+    if not itinerary or itinerary.deleted_at is not None or itinerary.status != "saved" or not owner or not owner.is_active or owner.deleted_at is not None:
         raise HTTPException(404, "分享链接不存在或已失效")
     return itinerary_dict(db, share.itinerary_id)
 
@@ -1208,9 +2544,17 @@ def revoke_share(itinerary_id: int, share_id: int, request: Request, user: User 
 def list_favorites(user: User = Depends(current_user), db: Session = Depends(get_db)):
     results = []
     for item in db.scalars(select(Favorite).where(Favorite.user_id == user.id).order_by(Favorite.id.desc())):
-        target_model = City if item.target_type == "city" else Attraction if item.target_type == "attraction" else Itinerary
+        target_model = {"city": City, "attraction": Attraction, "itinerary": Itinerary}.get(item.target_type)
+        if target_model is None:
+            continue
         target = db.get(target_model, item.target_id)
-        if target:
+        target_city = db.get(City, target.city_id) if isinstance(target, Attraction) else target if isinstance(target, City) else None
+        content_is_visible = (
+            target.user_id == user.id and target.deleted_at is None
+            if isinstance(target, Itinerary)
+            else bool(target and target.is_active and target_city and target_city.is_active)
+        )
+        if target and content_is_visible:
             results.append({"target_type": item.target_type, "target_id": item.target_id, "name": getattr(target, "name", getattr(target, "title", "行程")), "description": getattr(target, "description", ""), "image_url": getattr(target, "image_url", ""), "city_id": getattr(target, "city_id", None)})
     return results
 
@@ -1219,7 +2563,14 @@ def list_favorites(user: User = Depends(current_user), db: Session = Depends(get
 def add_favorite(target_type: str, target_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
     ensure_csrf(request)
     target_model = City if target_type == "city" else Attraction if target_type == "attraction" else Itinerary if target_type == "itinerary" else None
-    if not target_model or not db.get(target_model, target_id):
+    target = db.get(target_model, target_id) if target_model else None
+    target_city = db.get(City, target.city_id) if isinstance(target, Attraction) else target if isinstance(target, City) else None
+    content_is_visible = (
+        target.user_id == user.id and target.deleted_at is None
+        if isinstance(target, Itinerary)
+        else bool(target and target.is_active and target_city and target_city.is_active)
+    )
+    if not target or not content_is_visible:
         raise HTTPException(404, "收藏对象不存在")
     existing = db.scalar(select(Favorite).where(Favorite.user_id == user.id, Favorite.target_type == target_type, Favorite.target_id == target_id))
     if not existing:
@@ -1242,7 +2593,8 @@ def list_recent_views(user: User = Depends(current_user), db: Session = Depends(
     results = []
     for item in db.scalars(select(RecentView).where(RecentView.user_id == user.id).order_by(RecentView.viewed_at.desc()).limit(50)):
         target = db.get(City if item.target_type == "city" else Attraction, item.target_id)
-        if target:
+        target_city = db.get(City, target.city_id) if isinstance(target, Attraction) else target
+        if target and target.is_active and target_city and target_city.is_active:
             results.append({"target_type": item.target_type, "target_id": item.target_id, "name": target.name, "description": target.description, "image_url": target.image_url, "viewed_at": item.viewed_at})
     return results
 
@@ -1251,7 +2603,9 @@ def list_recent_views(user: User = Depends(current_user), db: Session = Depends(
 def add_recent_view(target_type: str, target_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
     ensure_csrf(request)
     target_model = City if target_type == "city" else Attraction if target_type == "attraction" else None
-    if not target_model or not db.get(target_model, target_id):
+    target = db.get(target_model, target_id) if target_model else None
+    target_city = db.get(City, target.city_id) if isinstance(target, Attraction) else target
+    if not target or not target.is_active or not target_city or not target_city.is_active:
         raise HTTPException(404, "浏览对象不存在")
     item = db.scalar(select(RecentView).where(RecentView.user_id == user.id, RecentView.target_type == target_type, RecentView.target_id == target_id))
     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -1279,15 +2633,44 @@ def admin_overview(user: User = Depends(current_user), db: Session = Depends(get
         "jobs": db.scalar(select(func.count(PlanningJob.id))),
         "sessions": db.scalar(select(func.count(ChatSession.id))),
         "deleted_sessions": db.scalar(select(func.count(ChatSession.id)).where(ChatSession.deleted_at.is_not(None))),
+        "itineraries": db.scalar(select(func.count(Itinerary.id))),
+        "deleted_itineraries": db.scalar(select(func.count(Itinerary.id)).where(Itinerary.deleted_at.is_not(None))),
         "feedback": db.scalar(select(func.count(ItineraryFeedback.id))),
+        "media_assets": db.scalar(select(func.count(MediaAsset.id))),
+        "community_posts": db.scalar(select(func.count(CommunityPost.id))),
+        "community_reports": db.scalar(select(func.count(ContentReport.id)).where(ContentReport.status == "open")),
     }
 
 
-@app.get("/api/v1/admin/users", response_model=list[AdminUserOut])
-def admin_users(user: User = Depends(current_user), db: Session = Depends(get_db)):
+@app.get("/api/v1/admin/users", response_model=AdminUserPageOut)
+def admin_users(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=10, le=100),
+    status_filter: str = Query(default="all", alias="status", pattern="^(all|active|disabled)$"),
+    search: str = Query(default="", max_length=100),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
     require_admin(user)
+    filters = []
+    if status_filter == "active":
+        filters.append(User.is_active.is_(True))
+    elif status_filter == "disabled":
+        filters.append(User.is_active.is_(False))
+    keyword = search.strip()
+    if keyword:
+        escaped_keyword = keyword.replace("%", "\\%").replace("_", "\\_")
+        filters.append(or_(
+            User.username.ilike(f"%{escaped_keyword}%"),
+            User.email.ilike(f"%{escaped_keyword}%"),
+            User.public_id.ilike(f"%{escaped_keyword}%"),
+        ))
+    total = db.scalar(select(func.count(User.id)).where(*filters)) or 0
     results = []
-    for account in db.scalars(select(User).order_by(User.created_at.desc(), User.id.desc())):
+    accounts = db.scalars(
+        select(User).where(*filters).order_by(User.created_at.desc(), User.id.desc()).offset((page - 1) * page_size).limit(page_size)
+    )
+    for account in accounts:
         results.append({
             "id": account.id,
             "public_id": account.public_id,
@@ -1299,14 +2682,21 @@ def admin_users(user: User = Depends(current_user), db: Session = Depends(get_db
             "session_count": db.scalar(select(func.count(ChatSession.id)).where(ChatSession.user_id == account.id)) or 0,
             "deleted_session_count": db.scalar(select(func.count(ChatSession.id)).where(ChatSession.user_id == account.id, ChatSession.deleted_at.is_not(None))) or 0,
         })
-    return results
+    return {"items": results, "total": total, "page": page, "page_size": page_size}
 
 
-@app.get("/api/v1/admin/feedback", response_model=list[AdminFeedbackOut])
-def admin_feedback(user: User = Depends(current_user), db: Session = Depends(get_db)):
+@app.get("/api/v1/admin/feedback", response_model=AdminFeedbackPageOut)
+def admin_feedback(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=10, le=10),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
     require_admin(user)
+    feedback_query = select(ItineraryFeedback).join(Itinerary, Itinerary.id == ItineraryFeedback.itinerary_id).join(User, User.id == ItineraryFeedback.user_id)
+    total = db.scalar(select(func.count(ItineraryFeedback.id)).join(Itinerary, Itinerary.id == ItineraryFeedback.itinerary_id).join(User, User.id == ItineraryFeedback.user_id)) or 0
     results = []
-    for feedback in db.scalars(select(ItineraryFeedback).order_by(ItineraryFeedback.created_at.desc()).limit(200)):
+    for feedback in db.scalars(feedback_query.order_by(ItineraryFeedback.created_at.desc(), ItineraryFeedback.id.desc()).offset((page - 1) * page_size).limit(page_size)):
         itinerary = db.get(Itinerary, feedback.itinerary_id)
         owner = db.get(User, feedback.user_id)
         if itinerary and owner:
@@ -1322,7 +2712,95 @@ def admin_feedback(user: User = Depends(current_user), db: Session = Depends(get
                 "created_at": feedback.created_at,
                 "updated_at": feedback.updated_at,
             })
-    return results
+    return {"items": results, "total": total, "page": page, "page_size": page_size}
+
+
+@app.get("/api/v1/admin/community/posts")
+def admin_community_posts(
+    status_filter: str = Query(default="all", alias="status", pattern="^(all|published|hidden)$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    require_admin(user)
+    filters = [] if status_filter == "all" else [CommunityPost.status == status_filter]
+    total = db.scalar(select(func.count(CommunityPost.id)).where(*filters)) or 0
+    posts = db.scalars(select(CommunityPost).where(*filters).order_by(CommunityPost.created_at.desc(), CommunityPost.id.desc()).offset((page - 1) * page_size).limit(page_size))
+    return {"items": [community_post_dict(db, post, user) for post in posts], "total": total, "page": page, "page_size": page_size}
+
+
+@app.patch("/api/v1/admin/community/posts/{post_id}")
+def admin_update_community_post(post_id: int, data: CommunityStatusUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    post = db.get(CommunityPost, post_id)
+    if not post:
+        raise HTTPException(404, "社区帖子不存在")
+    post.status = data.status
+    record_admin_audit(db, user, f"community_post_{data.status}", "community_post", post.id, f"{'公开' if data.status == 'published' else '下架'}社区帖子：{post.title}")
+    db.commit()
+    db.refresh(post)
+    return community_post_dict(db, post, user)
+
+
+@app.patch("/api/v1/admin/community/comments/{comment_id}")
+def admin_update_community_comment(comment_id: int, data: CommunityStatusUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    comment = db.get(CommunityComment, comment_id)
+    if not comment:
+        raise HTTPException(404, "社区评论不存在")
+    comment.status = data.status
+    record_admin_audit(db, user, f"community_comment_{data.status}", "community_comment", comment.id, f"{'公开' if data.status == 'published' else '隐藏'}社区评论")
+    db.commit()
+    return {"id": comment.id, "status": comment.status}
+
+
+@app.patch("/api/v1/admin/community/images/{image_id}")
+def admin_update_community_image(image_id: int, data: CommunityStatusUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    image = db.get(CommunityPostImage, image_id)
+    if not image:
+        raise HTTPException(404, "社区图片不存在")
+    image.status = data.status
+    record_admin_audit(db, user, f"community_image_{data.status}", "community_image", image.id, f"{'公开' if data.status == 'published' else '隐藏'}社区图片")
+    db.commit()
+    return {"id": image.id, "status": image.status}
+
+
+@app.get("/api/v1/admin/community/reports")
+def admin_community_reports(
+    status_filter: str = Query(default="open", alias="status", pattern="^(open|resolved|dismissed|all)$"),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    require_admin(user)
+    filters = [] if status_filter == "all" else [ContentReport.status == status_filter]
+    reports = db.scalars(select(ContentReport).where(*filters).order_by(ContentReport.created_at.desc(), ContentReport.id.desc()).limit(100))
+    return [{
+        "id": report.id,
+        "target_type": report.target_type,
+        "target_id": report.target_id,
+        "reason": report.reason,
+        "status": report.status,
+        "created_at": report.created_at,
+        "reporter": community_author_name(db, report.reporter_id),
+    } for report in reports]
+
+
+@app.patch("/api/v1/admin/community/reports/{report_id}")
+def admin_update_community_report(report_id: int, data: ContentReportStatusUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    report = db.get(ContentReport, report_id)
+    if not report:
+        raise HTTPException(404, "举报记录不存在")
+    report.status = data.status
+    record_admin_audit(db, user, f"community_report_{data.status}", "content_report", report.id, f"更新社区举报状态为：{data.status}")
+    db.commit()
+    return {"id": report.id, "status": report.status}
 
 
 @app.patch("/api/v1/admin/users/{user_id}", response_model=AdminUserOut)
@@ -1340,6 +2818,8 @@ def admin_update_user(user_id: int, data: AdminUserUpdateIn, request: Request, u
     if not data.is_active:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         db.execute(update(AuthSession).where(AuthSession.user_id == account.id, AuthSession.revoked_at.is_(None)).values(revoked_at=now, revoked_reason="admin_disabled"))
+    action = "activate" if data.is_active else "deactivate"
+    record_admin_audit(db, user, action, "user", account.id, f"{'启用' if data.is_active else '停用'}用户：{account.username}")
     db.commit()
     session_count = db.scalar(select(func.count(ChatSession.id)).where(ChatSession.user_id == account.id)) or 0
     deleted_count = db.scalar(select(func.count(ChatSession.id)).where(ChatSession.user_id == account.id, ChatSession.deleted_at.is_not(None))) or 0
@@ -1350,18 +2830,144 @@ def admin_update_user(user_id: int, data: AdminUserUpdateIn, request: Request, u
     }
 
 
-@app.get("/api/v1/admin/sessions", response_model=list[AdminSessionOut])
-def admin_sessions(state: str = "all", limit: int = Query(default=100, ge=1, le=200), user: User = Depends(current_user), db: Session = Depends(get_db)):
+def itinerary_association_counts(db: Session, itinerary: Itinerary) -> dict[str, int]:
+    return {
+        "分享": db.scalar(select(func.count(ShareLink.id)).where(ShareLink.itinerary_id == itinerary.id)) or 0,
+        "反馈": db.scalar(select(func.count(ItineraryFeedback.id)).where(ItineraryFeedback.itinerary_id == itinerary.id)) or 0,
+        "历史版本": db.scalar(select(func.count(ItineraryRevision.id)).where(ItineraryRevision.itinerary_id == itinerary.id)) or 0,
+        "Agent 运行": db.scalar(select(func.count(AgentRun.id)).where(AgentRun.itinerary_id == itinerary.id)) or 0,
+        "规划任务": db.scalar(select(func.count(PlanningJob.id)).where(PlanningJob.result_itinerary_id == itinerary.id)) or 0,
+        "收藏": db.scalar(select(func.count(Favorite.id)).where(Favorite.target_type == "itinerary", Favorite.target_id == itinerary.id)) or 0,
+        "社区帖子": db.scalar(select(func.count(CommunityPost.id)).where(CommunityPost.itinerary_id == itinerary.id)) or 0,
+    }
+
+
+def admin_itinerary_dict(db: Session, itinerary: Itinerary) -> dict:
+    owner = db.get(User, itinerary.user_id) if itinerary.user_id else None
+    associations = itinerary_association_counts(db, itinerary)
+    association_count = sum(associations.values())
+    return {
+        "id": itinerary.id,
+        "user_id": itinerary.user_id,
+        "username": owner.username if owner else "已注销用户",
+        "title": itinerary.title,
+        "city_name": itinerary.city_name,
+        "days": itinerary.days,
+        "status": itinerary.status,
+        "created_at": itinerary.created_at,
+        "deleted_at": itinerary.deleted_at,
+        "share_count": associations["分享"],
+        "feedback_count": associations["反馈"],
+        "revision_count": associations["历史版本"],
+        "association_count": association_count,
+        "can_hard_delete": itinerary.deleted_at is not None and association_count == 0,
+    }
+
+
+@app.get("/api/v1/admin/itineraries", response_model=AdminItineraryPageOut)
+def admin_itineraries(
+    state: str = Query(default="all", pattern="^(all|active|deleted)$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=10, le=10),
+    search: str = Query(default="", max_length=100),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
     require_admin(user)
-    if state not in {"all", "active", "archived", "deleted"}:
-        raise HTTPException(422, "无效的会话状态")
-    statement = select(ChatSession).order_by(func.coalesce(ChatSession.updated_at, ChatSession.created_at).desc(), ChatSession.id.desc()).limit(limit)
+    filters = []
     if state == "active":
-        statement = statement.where(ChatSession.deleted_at.is_(None), ChatSession.archived_at.is_(None))
-    elif state == "archived":
-        statement = statement.where(ChatSession.deleted_at.is_(None), ChatSession.archived_at.is_not(None))
+        filters.append(Itinerary.deleted_at.is_(None))
     elif state == "deleted":
-        statement = statement.where(ChatSession.deleted_at.is_not(None))
+        filters.append(Itinerary.deleted_at.is_not(None))
+    keyword = search.strip()
+    statement = select(Itinerary)
+    count_statement = select(func.count(Itinerary.id))
+    if keyword:
+        escaped_keyword = keyword.replace("%", "\\%").replace("_", "\\_")
+        search_filter = or_(
+            Itinerary.title.ilike(f"%{escaped_keyword}%"),
+            Itinerary.city_name.ilike(f"%{escaped_keyword}%"),
+            User.username.ilike(f"%{escaped_keyword}%"),
+            User.email.ilike(f"%{escaped_keyword}%"),
+        )
+        statement = statement.outerjoin(User, User.id == Itinerary.user_id)
+        count_statement = count_statement.outerjoin(User, User.id == Itinerary.user_id)
+        filters.append(search_filter)
+    total = db.scalar(count_statement.where(*filters)) or 0
+    itineraries = db.scalars(
+        statement.where(*filters).order_by(Itinerary.created_at.desc(), Itinerary.id.desc()).offset((page - 1) * page_size).limit(page_size)
+    )
+    return {"items": [admin_itinerary_dict(db, itinerary) for itinerary in itineraries], "total": total, "page": page, "page_size": page_size}
+
+
+@app.post("/api/v1/admin/itineraries/{itinerary_id}/restore", response_model=AdminItineraryOut)
+def admin_restore_itinerary(itinerary_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    itinerary = db.get(Itinerary, itinerary_id)
+    if not itinerary:
+        raise HTTPException(404, "行程不存在")
+    if itinerary.deleted_at is None:
+        raise HTTPException(409, "行程未被删除")
+    itinerary.deleted_at = None
+    record_admin_audit(db, user, "restore", "itinerary", itinerary.id, f"恢复行程：{itinerary.title}", {"owner_user_id": itinerary.user_id})
+    db.commit()
+    return admin_itinerary_dict(db, itinerary)
+
+
+@app.delete("/api/v1/admin/itineraries/{itinerary_id}", status_code=204)
+def admin_hard_delete_itinerary(itinerary_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    itinerary = db.get(Itinerary, itinerary_id)
+    if not itinerary:
+        raise HTTPException(404, "行程不存在")
+    if itinerary.deleted_at is None:
+        raise HTTPException(409, "请先将行程移入回收站")
+    associations = itinerary_association_counts(db, itinerary)
+    related = [f"{name} {count} 条" for name, count in associations.items() if count]
+    if related:
+        raise HTTPException(409, f"行程仍有关联数据，不能彻底删除：{'、'.join(related)}")
+    validation = db.scalar(select(ItineraryValidation).where(ItineraryValidation.itinerary_id == itinerary.id))
+    if validation:
+        db.delete(validation)
+    record_admin_audit(db, user, "hard_delete", "itinerary", itinerary.id, f"彻底删除无外部关联行程：{itinerary.title}", {"owner_user_id": itinerary.user_id})
+    db.delete(itinerary)
+    db.commit()
+
+
+@app.get("/api/v1/admin/sessions", response_model=AdminSessionPageOut)
+def admin_sessions(
+    state: str = Query(default="all", pattern="^(all|active|archived|deleted)$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=10, le=10),
+    search: str = Query(default="", max_length=100),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    require_admin(user)
+    filters = []
+    if state == "active":
+        filters.extend([ChatSession.deleted_at.is_(None), ChatSession.archived_at.is_(None)])
+    elif state == "archived":
+        filters.extend([ChatSession.deleted_at.is_(None), ChatSession.archived_at.is_not(None)])
+    elif state == "deleted":
+        filters.append(ChatSession.deleted_at.is_not(None))
+    keyword = search.strip()
+    statement = select(ChatSession)
+    count_statement = select(func.count(ChatSession.id))
+    if keyword:
+        escaped_keyword = keyword.replace("%", "\\%").replace("_", "\\_")
+        search_filter = or_(
+            ChatSession.title.ilike(f"%{escaped_keyword}%"),
+            User.username.ilike(f"%{escaped_keyword}%"),
+            User.email.ilike(f"%{escaped_keyword}%"),
+        )
+        statement = statement.outerjoin(User, User.id == ChatSession.user_id)
+        count_statement = count_statement.outerjoin(User, User.id == ChatSession.user_id)
+        filters.append(search_filter)
+    total = db.scalar(count_statement.where(*filters)) or 0
+    statement = statement.where(*filters).order_by(func.coalesce(ChatSession.updated_at, ChatSession.created_at).desc(), ChatSession.id.desc()).offset((page - 1) * page_size).limit(page_size)
     results = []
     for chat in db.scalars(statement):
         owner = db.get(User, chat.user_id) if chat.user_id else None
@@ -1379,7 +2985,7 @@ def admin_sessions(state: str = "all", limit: int = Query(default=100, ge=1, le=
             "updated_at": chat.updated_at,
             "deleted_at": chat.deleted_at,
         })
-    return results
+    return {"items": results, "total": total, "page": page, "page_size": page_size}
 
 
 @app.post("/api/v1/admin/sessions/{session_id}/restore", response_model=AdminSessionOut)
@@ -1391,6 +2997,7 @@ def admin_restore_session(session_id: int, request: Request, user: User = Depend
         raise HTTPException(404, "会话不存在")
     chat.deleted_at = None
     chat.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    record_admin_audit(db, user, "restore", "session", chat.id, f"恢复会话：{chat.title}", {"owner_user_id": chat.user_id})
     db.commit()
     owner = db.get(User, chat.user_id) if chat.user_id else None
     return {

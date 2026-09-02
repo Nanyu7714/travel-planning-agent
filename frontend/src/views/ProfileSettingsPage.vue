@@ -85,4 +85,16 @@ onMounted(async () => {
 .delete-account-button:hover:not(:disabled) { background: var(--danger); color: white; }
 .delete-account-button:disabled { opacity: .45; cursor: not-allowed; }
 @media (max-width: 600px) { .profile-fields > div { grid-template-columns: 1fr; gap: 7px; padding: 13px 0; }.delete-account-form { grid-template-columns: 1fr; } }
+.settings-page { max-width: 1000px; }
+.profile-section { padding-top: 32px; border-top-color: var(--color-border-soft); }
+.profile-fields > div { min-height: 72px; grid-template-columns: 220px minmax(0, 1fr); border-bottom-color: var(--color-border-soft); }
+.profile-fields dt { color: var(--color-muted); font-size: 13px; }
+.profile-fields dd { color: var(--color-ink); font-size: 14px; }
+.public-id { font-size: 22px; letter-spacing: 1px; }
+.danger-section { border-top-color: var(--color-danger); }
+.danger-section .section-heading { color: var(--color-danger); }
+.danger-eyebrow { color: var(--color-danger); }
+.password-field { min-height: 48px; padding: 0 12px; border-color: var(--color-border); border-radius: var(--radius-control); }
+.delete-account-button { min-height: 48px; padding: 0 16px; border-radius: var(--radius-control); }
+@media (max-width: 600px) { .profile-fields > div { grid-template-columns: 1fr; min-height: 0; padding: 14px 0; } }
 </style>

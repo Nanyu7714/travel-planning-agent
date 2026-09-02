@@ -3,7 +3,11 @@ import uuid
 
 from fastapi.testclient import TestClient
 
+from app.db import SessionLocal
 from app.main import app
+from app.models import City
+from app.services import city_followup_response, is_city_overview_request
+from conftest import register_and_login
 
 
 def send(client: TestClient, session_id: int, csrf: str, content: str, expected_assistant_count: int) -> None:
@@ -32,12 +36,8 @@ def wait_for_job(client: TestClient, job_id: int) -> dict:
 
 def test_agent_remembers_name_and_answers_identity():
     with TestClient(app) as client:
-        suffix = uuid.uuid4().hex[:12]
-        registration = client.post(
-            "/api/v1/auth/register",
-            json={"username": f"profile{suffix}", "email": f"profile{suffix}@example.com", "password": "test123456"},
-        )
-        assert registration.status_code == 201
+        suffix = str(uuid.uuid4().int)
+        register_and_login(client, f"test{suffix}", f"test{suffix}@example.com")
         csrf = client.cookies.get("csrf_token")
         session = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf})
         session_id = session.json()["id"]
@@ -56,6 +56,21 @@ def test_agent_remembers_name_and_answers_identity():
         assert assistant_replies[1] != assistant_replies[2]
         assert not any("北京、上海还是成都" in reply for reply in assistant_replies)
         assert not any((message.get("payload") or {}).get("type") == "plan_confirm" for message in messages)
+
+
+def test_city_followups_use_context_instead_of_replaying_destination_overview():
+    db = SessionLocal()
+    try:
+        chengdu = db.query(City).filter(City.name == "成都").one()
+        food_reply = city_followup_response("有没有推荐的美食", chengdu, db)
+        season_reply = city_followup_response("推荐什么时间去", chengdu, db)
+    finally:
+        db.close()
+    assert is_city_overview_request("我想去成都") is True
+    assert is_city_overview_request("有没有推荐的美食") is False
+    assert is_city_overview_request("我想去成都，有什么好吃的") is False
+    assert food_reply and "火锅" in food_reply and "宽窄巷子" in food_reply
+    assert season_reply and "春秋" in season_reply
 
 
 def test_agent_only_starts_planning_after_explicit_request():
@@ -90,12 +105,8 @@ def test_clear_conversation_hides_session_without_removing_messages():
 
 def test_session_titles_and_management_actions():
     with TestClient(app) as client:
-        suffix = uuid.uuid4().hex[:12]
-        registration = client.post(
-            "/api/v1/auth/register",
-            json={"username": f"sessions{suffix}", "email": f"sessions{suffix}@example.com", "password": "test123456"},
-        )
-        assert registration.status_code == 201
+        suffix = str(uuid.uuid4().int)
+        register_and_login(client, f"test{suffix}", f"test{suffix}@example.com")
         csrf = client.cookies.get("csrf_token")
         headers = {"X-CSRF-Token": csrf}
         first = client.post("/api/v1/sessions", json={}, headers=headers).json()
@@ -142,7 +153,13 @@ def test_session_titles_and_management_actions():
         admin_csrf = client.cookies.get("csrf_token")
         admin_users = client.get("/api/v1/admin/users")
         assert admin_users.status_code == 200
-        deleted_sessions = client.get("/api/v1/admin/sessions?state=deleted").json()
+        assert admin_users.json()["total"] >= 2
+        assert len(admin_users.json()["items"]) <= 20
+        searched_users = client.get("/api/v1/admin/users?page=1&page_size=10&status=active&search=admin")
+        assert searched_users.status_code == 200
+        assert searched_users.json()["total"] == 1
+        assert searched_users.json()["items"][0]["username"] == "admin"
+        deleted_sessions = client.get("/api/v1/admin/sessions?state=deleted&page=1&page_size=10").json()["items"]
         retained = next(item for item in deleted_sessions if item["id"] == second["id"])
         assert retained["title"] == "上海摄影周末"
         assert retained["message_count"] >= 2
@@ -152,9 +169,59 @@ def test_session_titles_and_management_actions():
         assert restored.status_code == 200
         assert restored.json()["deleted_at"] is None
 
-        user_login = client.post("/api/v1/auth/login", json={"account": f"sessions{suffix}", "password": "test123456"})
+        user_login = client.post("/api/v1/auth/login", json={"account": f"test{suffix}", "password": "test123456"})
         assert user_login.status_code == 200
         assert second["id"] in {item["id"] for item in client.get("/api/v1/sessions").json()}
+
+
+def test_bulk_session_management_requires_password_for_three_or_more_deletions():
+    with TestClient(app) as client:
+        suffix = str(uuid.uuid4().int)
+        password = "test123456"
+        register_and_login(client, f"bulk{suffix}", f"bulk{suffix}@example.com", password)
+        headers = {"X-CSRF-Token": client.cookies.get("csrf_token")}
+        sessions = [client.post("/api/v1/sessions", json={}, headers=headers).json() for _ in range(3)]
+        session_ids = [session["id"] for session in sessions]
+
+        archived = client.post(
+            "/api/v1/sessions/bulk",
+            json={"session_ids": session_ids[:2], "action": "archive"},
+            headers=headers,
+        )
+        assert archived.status_code == 200
+        assert archived.json() == {"processed_count": 2, "action": "archive"}
+        assert {item["id"] for item in client.get("/api/v1/sessions?archived=true").json()} == set(session_ids[:2])
+
+        restored = client.post(
+            "/api/v1/sessions/bulk",
+            json={"session_ids": session_ids[:2], "action": "restore"},
+            headers=headers,
+        )
+        assert restored.status_code == 200
+        assert {item["id"] for item in client.get("/api/v1/sessions").json()} == set(session_ids)
+
+        missing_password = client.post(
+            "/api/v1/sessions/bulk",
+            json={"session_ids": session_ids, "action": "delete"},
+            headers=headers,
+        )
+        assert missing_password.status_code == 403
+        wrong_password = client.post(
+            "/api/v1/sessions/bulk",
+            json={"session_ids": session_ids, "action": "delete", "password": "wrong-password"},
+            headers=headers,
+        )
+        assert wrong_password.status_code == 403
+
+        deleted = client.post(
+            "/api/v1/sessions/bulk",
+            json={"session_ids": session_ids, "action": "delete", "password": password},
+            headers=headers,
+        )
+        assert deleted.status_code == 200
+        assert deleted.json() == {"processed_count": 3, "action": "delete"}
+        assert client.get("/api/v1/sessions").json() == []
+        assert client.get(f"/api/v1/sessions/{session_ids[0]}/messages").status_code == 404
 
 
 def test_plan_requires_confirmation_and_idempotency():
@@ -207,7 +274,7 @@ def test_plan_requires_confirmation_and_idempotency():
         assert itinerary["days"] == 3
         assert itinerary["preferences"] == ["摄影", "美食"]
         assert itinerary["validation"]["daily_load"]["status"] == "partial"
-        assert itinerary["validation"]["travel"]["status"] == "unknown"
+        assert itinerary["validation"]["travel"]["status"] == "partial"
         assert itinerary["budget_scope"] == "仅门票估算；交通和餐饮未计入"
 
 
@@ -276,3 +343,60 @@ def test_longer_plan_uses_available_attractions_without_fabrication():
         assert itinerary["validation"]["daily_load"]["status"] == "partial"
         stops = [stop for day in itinerary["itinerary_days"] for stop in day["stops"]]
         assert len(stops) == len({stop["attraction_id"] for stop in stops}) == 4
+
+
+def test_plan_persists_agent_tool_trace_and_repairs_ticket_budget():
+    with TestClient(app) as client:
+        client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        csrf = client.cookies.get("csrf_token")
+        session_id = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf}).json()["id"]
+        message = client.post(
+            f"/api/v1/sessions/{session_id}/messages",
+            json={"content": "帮我规划北京2天历史文化行程"},
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
+        )
+        wait_for_job(client, message.json()["job_id"])
+        confirmed = client.post(
+            f"/api/v1/sessions/{session_id}/plan-confirm",
+            json={"confirmed": True, "patch": {"budget_total": 20, "traveler_count": 1}},
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
+        )
+        job = wait_for_job(client, confirmed.json()["job_id"])
+        assert job["status"] == "completed"
+
+        trace = client.get(f"/api/v1/itineraries/{job['result_itinerary_id']}/agent-run")
+        assert trace.status_code == 200
+        payload = trace.json()
+        assert payload["algorithm_version"] == "tool-agent-v2"
+        tool_names = [step["tool_name"] for step in payload["steps"]]
+        assert tool_names[0] == "search_attractions"
+        assert {"repair_plan", "select_stops", "get_attraction_detail", "estimate_budget", "calculate_route_or_area_order", "validate_schedule", "validate_plan", "save_itinerary_draft"}.issubset(tool_names)
+        assert tool_names[-1] == "save_itinerary_draft"
+        assert payload["summary"]["budget_repair_applied"] is True
+        assert payload["summary"]["repair_attempts"] == 1
+        assert payload["summary"]["ticket_estimate"] <= 20
+
+        itinerary = client.get(f"/api/v1/itineraries/{job['result_itinerary_id']}").json()
+        stop_id = itinerary["itinerary_days"][0]["stops"][0]["attraction_id"]
+        replanned = client.post(
+            f"/api/v1/itineraries/{job['result_itinerary_id']}/replan",
+            json={"actions": [{"type": "remove_attraction", "attraction_id": stop_id}]},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert replanned.status_code == 200
+        assert stop_id not in {stop["attraction_id"] for day in replanned.json()["itinerary_days"] for stop in day["stops"]}
+
+
+def test_model_failure_diagnostics_are_restricted_to_administrators():
+    with TestClient(app) as client:
+        client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        response = client.get("/api/v1/admin/agent-status")
+        assert response.status_code == 200
+        payload = response.json()
+        assert {"mode", "state", "last_error", "last_failure_at", "runs"}.issubset(payload)
+        assert {"completed", "failed", "running"}.issubset(payload["runs"])
+
+    with TestClient(app) as client:
+        suffix = str(uuid.uuid4().int)
+        register_and_login(client, f"test{suffix}", f"test{suffix}@example.com")
+        assert client.get("/api/v1/admin/agent-status").status_code == 403

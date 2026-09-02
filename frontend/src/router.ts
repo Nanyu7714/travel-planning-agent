@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import HomePage from './views/HomePage.vue'
+import AuthLandingPage from './views/AuthLandingPage.vue'
 import PlannerPage from './views/PlannerPage.vue'
 import ItinerariesPage from './views/ItinerariesPage.vue'
 import AdminPage from './views/AdminPage.vue'
@@ -17,11 +18,29 @@ import SecuritySettingsPage from './views/SecuritySettingsPage.vue'
 import ItineraryDetailPage from './views/ItineraryDetailPage.vue'
 import ShareItineraryPage from './views/ShareItineraryPage.vue'
 import AdminFeedbackPage from './views/AdminFeedbackPage.vue'
+import AdminMediaAssetsPage from './views/AdminMediaAssetsPage.vue'
+import AdminRankingsPage from './views/AdminRankingsPage.vue'
+import AdminAuditLogsPage from './views/AdminAuditLogsPage.vue'
+import CommunityPage from './views/CommunityPage.vue'
+import CommunityDetailPage from './views/CommunityDetailPage.vue'
+import CommunityPublishPage from './views/CommunityPublishPage.vue'
+import AdminCommunityPage from './views/AdminCommunityPage.vue'
+import AdminItinerariesPage from './views/AdminItinerariesPage.vue'
+import AuthActionPage from './views/AuthActionPage.vue'
 
 export default createRouter({
   history: createWebHistory(),
   routes: [
-    { path: '/', component: HomePage },
+    { path: '/', name: 'entry', component: AuthLandingPage },
+    { path: '/auth/verify-email', name: 'auth-verify', component: AuthActionPage },
+    { path: '/auth/resend-verification', name: 'auth-resend', component: AuthActionPage },
+    { path: '/auth/forgot-password', name: 'auth-forgot', component: AuthActionPage },
+    { path: '/auth/reset-password', name: 'auth-reset', component: AuthActionPage },
+    { path: '/auth/confirm-email-change', name: 'auth-change-confirm', component: AuthActionPage },
+    { path: '/discover', name: 'discover', component: HomePage },
+    { path: '/community', component: CommunityPage },
+    { path: '/community/publish', component: CommunityPublishPage },
+    { path: '/community/posts/:id', component: CommunityDetailPage },
     { path: '/planner', component: PlannerPage },
     { path: '/itineraries', component: ItinerariesPage },
     { path: '/itineraries/:id', component: ItineraryDetailPage },
@@ -39,5 +58,10 @@ export default createRouter({
     { path: '/admin/users', component: AdminUsersPage },
     { path: '/admin/sessions', component: AdminSessionsPage },
     { path: '/admin/feedback', component: AdminFeedbackPage },
+    { path: '/admin/media-assets', component: AdminMediaAssetsPage },
+    { path: '/admin/rankings', component: AdminRankingsPage },
+    { path: '/admin/audit-logs', component: AdminAuditLogsPage },
+    { path: '/admin/community', component: AdminCommunityPage },
+    { path: '/admin/itineraries', component: AdminItinerariesPage },
   ],
 })

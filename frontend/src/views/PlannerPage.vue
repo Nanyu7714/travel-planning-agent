@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ArrowUp, Bot, Check, Clock3, LoaderCircle, Map, Send, Square, Trash2, UserRound } from 'lucide-vue-next'
-import { api, apiUrl, getCities, type City } from '../api'
+import { api, apiUrl, bulkUpdateSessions, getCities, type City, type SessionBulkAction } from '../api'
 import { useRouter } from 'vue-router'
 import SessionRail, { type ChatSession } from '../components/SessionRail.vue'
 
@@ -40,9 +40,19 @@ const lastEventId = ref(0)
 const sessions = ref<ChatSession[]>([])
 const archivedView = ref(false)
 const railCollapsed = ref(false)
+const selectionMode = ref(false)
+const selectedSessionIds = ref<number[]>([])
+const bulkAction = ref<SessionBulkAction | null>(null)
+const bulkTargetIds = ref<number[]>([])
+const bulkPassword = ref('')
+const bulkError = ref('')
+const bulkSubmitting = ref(false)
 let eventSource: EventSource | null = null
+let reconcilingSseError = false
 
 const briefLocked = computed(() => !sessionId.value || archivedView.value || sending.value)
+const bulkActionLabel = computed(() => bulkAction.value === 'delete' ? '删除' : bulkAction.value === 'restore' ? '恢复' : '归档')
+const bulkNeedsPassword = computed(() => bulkAction.value === 'delete' && bulkTargetIds.value.length >= 3)
 
 const activeSessionKey = 'travel-planner-active-session'
 const eventCursorKey = (id: number) => `travel-planner-event-${id}`
@@ -96,6 +106,7 @@ async function loadSession(session: ChatSession) {
 async function loadSessions() {
   try {
     sessions.value = await api<ChatSession[]>(`/sessions?archived=${archivedView.value}`)
+    resetSelection()
     const savedId = Number(localStorage.getItem(activeSessionKey))
     const active = sessions.value.find((session) => session.id === savedId) || sessions.value[0]
     if (active) await loadSession(active)
@@ -114,11 +125,13 @@ async function newSession() {
   localStorage.removeItem(activeSessionKey)
   messages.value = [{ role: 'assistant', content: '新的对话已经准备好。可以先聊旅行偏好，需要规划时再告诉我。' }]
   resetRequirement()
+  resetSelection()
 }
 
 async function switchSessionView() {
   archivedView.value = !archivedView.value
   sessions.value = await api<ChatSession[]>(`/sessions?archived=${archivedView.value}`)
+  resetSelection()
   if (sessions.value[0]) await loadSession(sessions.value[0])
   else {
     sessionId.value = null
@@ -150,21 +163,69 @@ async function togglePin(session: ChatSession) {
 }
 
 async function toggleArchive(session: ChatSession) {
-  try {
-    await updateSession(session, { archived: !session.archived_at })
-    sessions.value = sessions.value.filter((item) => item.id !== session.id)
-    if (sessionId.value === session.id) await newSession()
-  } catch (error) { window.alert(error instanceof Error ? error.message : '操作失败') }
+  openBulkAction(session.archived_at ? 'restore' : 'archive', [session.id])
 }
 
-async function deleteSession(session: ChatSession) {
-  if (!window.confirm(`确定删除“${session.title}”吗？它会从你的会话列表中移除，如需恢复请联系管理员。`)) return
+function deleteSession(session: ChatSession) {
+  openBulkAction('delete', [session.id])
+}
+
+function resetSelection() {
+  selectionMode.value = false
+  selectedSessionIds.value = []
+}
+
+function toggleSelectionMode() {
+  selectionMode.value = !selectionMode.value
+  selectedSessionIds.value = []
+}
+
+function toggleSelection(session: ChatSession) {
+  selectedSessionIds.value = selectedSessionIds.value.includes(session.id)
+    ? selectedSessionIds.value.filter((id) => id !== session.id)
+    : [...selectedSessionIds.value, session.id]
+}
+
+function toggleSelectAll() {
+  const visibleIds = sessions.value.map((session) => session.id)
+  selectedSessionIds.value = selectedSessionIds.value.length === visibleIds.length ? [] : visibleIds
+}
+
+function openBulkAction(action: SessionBulkAction, sessionIds = selectedSessionIds.value) {
+  if (!sessionIds.length) return
+  bulkAction.value = action
+  bulkTargetIds.value = [...new Set(sessionIds)]
+  bulkPassword.value = ''
+  bulkError.value = ''
+}
+
+function closeBulkAction(force = false) {
+  if (bulkSubmitting.value && !force) return
+  bulkAction.value = null
+  bulkTargetIds.value = []
+  bulkPassword.value = ''
+  bulkError.value = ''
+}
+
+async function confirmBulkAction() {
+  if (!bulkAction.value || !bulkTargetIds.value.length) return
+  bulkSubmitting.value = true
+  bulkError.value = ''
   try {
-    await api(`/sessions/${session.id}`, { method: 'DELETE' })
-    sessions.value = sessions.value.filter((item) => item.id !== session.id)
-    localStorage.removeItem(eventCursorKey(session.id))
-    if (sessionId.value === session.id) await newSession()
-  } catch (error) { window.alert(error instanceof Error ? error.message : '删除失败') }
+    const action = bulkAction.value
+    const affectedIds = [...bulkTargetIds.value]
+    await bulkUpdateSessions(affectedIds, action, bulkPassword.value || undefined)
+    sessions.value = sessions.value.filter((item) => !affectedIds.includes(item.id))
+    affectedIds.forEach((id) => localStorage.removeItem(eventCursorKey(id)))
+    const activeAffected = sessionId.value !== null && affectedIds.includes(sessionId.value)
+    closeBulkAction(true)
+    resetSelection()
+    if (activeAffected) await newSession()
+  } catch (error) {
+    bulkError.value = error instanceof Error ? error.message : `${bulkActionLabel.value}失败，请重试。`
+  } finally {
+    bulkSubmitting.value = false
+  }
 }
 
 async function clearConversation() {
@@ -260,6 +321,22 @@ async function connectEvents(id: number) {
     }
   }
   const parse = (event: Event) => JSON.parse((event as MessageEvent).data) as ServerEvent
+  let deliveredAgentError = false
+  const reconcileConnectionError = async () => {
+    if (!sending.value || eventSource !== source || reconcilingSseError) return
+    reconcilingSseError = true
+    try {
+      if (!jobId.value) { stage.value = '实时连接正在重试'; return }
+      const job = await api<{ status: string; error_message: string | null }>(`/planning-jobs/${jobId.value}`)
+      if (job.status === 'failed') {
+        if (!deliveredAgentError) messages.value.push({ role: 'assistant', content: job.error_message || '规划失败，请调整条件后重试。' })
+        source.close(); if (eventSource === source) eventSource = null; sending.value = false; stage.value = '规划失败'
+      } else if (job.status === 'completed' || job.status === 'cancelled') {
+        source.close(); if (eventSource === source) eventSource = null; sending.value = false; stage.value = job.status === 'cancelled' ? '已停止' : '规划完成'
+      } else stage.value = '实时连接正在重试'
+    } catch { stage.value = '实时连接正在重试' }
+    finally { reconcilingSseError = false }
+  }
   const close = (label = '处理完成') => { source.close(); if (eventSource === source) eventSource = null; sending.value = false; stage.value = label; void loadAgentStatus() }
   source.addEventListener('stage', (event) => { rememberEvent(event); stage.value = String(parse(event).payload.message || '正在处理') })
   source.addEventListener('message', (event) => { rememberEvent(event); const data = parse(event).payload; messages.value.push({ role: 'assistant', content: String(data.content || ''), payload: data as MessagePayload }) })
@@ -280,6 +357,15 @@ async function connectEvents(id: number) {
   source.addEventListener('reset', async (event) => { const data = parse(event); messages.value.push({ role: 'assistant', content: String(data.payload.message || '事件已过期，正在重新同步。') }); const active = sessions.value.find((item) => item.id === id); if (active) await loadSession(active); close('已重新同步') })
   source.addEventListener('error', (event) => { if ((event as MessageEvent).data) { rememberEvent(event); const data = parse(event).payload; messages.value.push({ role: 'assistant', content: String(data.message || '规划失败') }) } })
   source.onerror = () => { if (sending.value) { source.close(); sending.value = false; stage.value = '连接已断开，可从任务列表恢复' } }
+  source.addEventListener('agent_error', (event) => {
+    rememberEvent(event)
+    const data = parse(event).payload
+    deliveredAgentError = true
+    messages.value.push({ role: 'assistant', content: String(data.message || '规划失败，请调整条件后重试。') })
+    stage.value = '规划失败，正在确认任务状态'
+  })
+  // Browser transport errors are retried by EventSource; first reconcile the persisted job state.
+  source.onerror = () => { void reconcileConnectionError() }
 }
 function openItinerary(id?: number) { if (id) router.push(`/itineraries/${id}`) }
 onMounted(async () => { cities.value = await getCities().catch(() => []); await Promise.all([loadSessions(), loadAgentStatus()]); await nextTick(); scrollBox.value?.scrollTo({ top: scrollBox.value.scrollHeight }) })
@@ -292,6 +378,8 @@ onBeforeUnmount(() => { eventSource?.close(); eventSource = null })
       :sessions="sessions"
       :active-session-id="sessionId"
       :archived-view="archivedView"
+      :selection-mode="selectionMode"
+      :selected-session-ids="selectedSessionIds"
       @select="loadSession"
       @create="newSession"
       @switch-view="switchSessionView"
@@ -299,6 +387,11 @@ onBeforeUnmount(() => { eventSource?.close(); eventSource = null })
       @pin="togglePin"
       @archive="toggleArchive"
       @delete="deleteSession"
+      @toggle-selection-mode="toggleSelectionMode"
+      @toggle-selection="toggleSelection"
+      @select-all="toggleSelectAll"
+      @bulk-archive="openBulkAction(archivedView ? 'restore' : 'archive')"
+      @bulk-delete="openBulkAction('delete')"
       @collapse="railCollapsed = $event"
     />
 
@@ -359,33 +452,72 @@ onBeforeUnmount(() => { eventSource?.close(); eventSource = null })
         <div class="summary-tip"><Check :size="16" /><span>{{ pendingConfirmation ? '清单由 AI 根据对话填写，你可以修改后再确认。' : sessionId ? '本轮对话已结束，你可以先补充或修改清单；AI 整理出完整需求后即可确认。' : '开始对话后，AI 会先整理清单并等待你确认。' }}</span></div>
       </aside>
     </div>
+
+    <div v-if="bulkAction" class="bulk-dialog-backdrop" role="presentation" @click.self="closeBulkAction">
+      <form class="bulk-dialog" role="dialog" aria-modal="true" :aria-labelledby="'bulk-dialog-title'" @submit.prevent="confirmBulkAction">
+        <span class="eyebrow">CONFIRM ACTION</span>
+        <h2 id="bulk-dialog-title">确认{{ bulkActionLabel }} {{ bulkTargetIds.length }} 条对话？</h2>
+        <p v-if="bulkAction === 'delete'">删除后对话将从你的列表移除，如需恢复请联系管理员。</p>
+        <p v-else-if="bulkAction === 'restore'">恢复后，对话会回到当前会话列表，可以继续规划。</p>
+        <p v-else>归档后，对话将移到归档列表，之后可以恢复。</p>
+        <label v-if="bulkNeedsPassword">当前账号密码<input v-model="bulkPassword" type="password" autocomplete="current-password" required placeholder="请输入密码确认批量删除" /></label>
+        <p v-if="bulkError" class="bulk-error" role="alert">{{ bulkError }}</p>
+        <div class="bulk-dialog-actions">
+          <button class="secondary-button" type="button" :disabled="bulkSubmitting" @click="closeBulkAction">取消</button>
+          <button :class="bulkAction === 'delete' ? 'danger-button' : 'primary-button'" type="submit" :disabled="bulkSubmitting">{{ bulkSubmitting ? '正在处理' : `确认${bulkActionLabel}` }}</button>
+        </div>
+      </form>
+    </div>
   </div>
 </template>
 
 <style scoped>
-.planner-frame { max-width: 1440px; margin: auto; min-height: calc(100vh - 64px); display: grid; grid-template-columns: 220px minmax(0, 1fr) 250px; transition: grid-template-columns .18s ease; }
-.planner-frame.rail-collapsed { grid-template-columns: 56px minmax(0, 1fr) 250px; }
+.planner-frame { max-width: 1440px; min-height: calc(100vh - 80px); margin: auto; display: grid; grid-template-columns: 220px minmax(0, 1fr) 280px; background: var(--color-canvas); transition: grid-template-columns 180ms ease; }
+.planner-frame.rail-collapsed { grid-template-columns: 64px minmax(0, 1fr) 280px; }
 .planner-frame > .planner-shell { display: contents; }
-.confirm-card { margin-top: 10px; border: 1px solid var(--border); background: var(--surface); padding: 16px; }
-.confirm-card dl { margin: 0 0 12px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 18px; }
+.conversation-panel { min-width: 0; min-height: calc(100vh - 80px); border-left: 1px solid var(--color-border-soft); border-right: 1px solid var(--color-border-soft); }
+.planner-header { min-height: 88px; padding: 24px 48px; align-items: center; }
+.planner-header h1 { font-size: 22px; }
+.message-list { max-width: 900px; max-height: calc(100vh - 248px); margin: 0 auto; padding: 32px 48px; }
+.message-line { max-width: 760px; margin-bottom: 24px; }
+.message-content { max-width: 620px; }
+.message-content p { border-radius: var(--radius-control); line-height: 1.5; }
+.user .message-content p { background: var(--color-primary); border-color: var(--color-primary); color: var(--color-on-primary); }
+.confirm-card { margin-top: 12px; padding: 16px; border: 1px solid var(--color-border); border-radius: var(--radius-card); background: var(--color-surface); }
+.confirm-card dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 18px; margin: 0 0 12px; }
 .confirm-card dl div { min-width: 0; }
-.confirm-card dt { color: var(--secondary); font-size: 11px; }
-.confirm-card dd { margin: 4px 0 0; font-size: 13px; overflow-wrap: anywhere; }
-.confirm-card small { color: var(--secondary); line-height: 1.6; }
-.confirm-actions { display: flex; gap: 8px; margin-top: 14px; }
-.brief-form { display: grid; gap: 13px; padding-top: 18px; }
-.brief-form label { display: grid; gap: 6px; color: var(--secondary); font-size: 11px; }
-.brief-form input, .brief-form select { width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text); outline: 0; }
-.brief-form input:focus, .brief-form select:focus { border-color: var(--primary); }
-.brief-form input:disabled, .brief-form select:disabled { background: transparent; color: var(--text); opacity: 1; }
+.confirm-card dt { color: var(--color-muted); font-size: 12px; }
+.confirm-card dd { margin: 4px 0 0; color: var(--color-ink); font-size: 14px; overflow-wrap: anywhere; }
+.confirm-card small { color: var(--color-muted); line-height: 1.5; }
+.confirm-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.summary-rail { min-width: 0; padding: 32px 24px; border-left: 0; background: var(--color-surface-soft); }
+.summary-heading { padding-bottom: 16px; border-bottom-color: var(--color-border); }
+.summary-heading h2 { margin: 0; font-size: 20px; }
+.brief-form { display: grid; gap: 14px; padding-top: 20px; }
+.brief-form label { display: grid; gap: 6px; color: var(--color-muted); font-size: 12px; }
+.brief-form input, .brief-form select { width: 100%; min-width: 0; min-height: 48px; padding: 12px; border: 1px solid var(--color-border); border-radius: var(--radius-control); background: var(--color-surface); color: var(--color-ink); outline: 0; }
+.brief-form input:focus, .brief-form select:focus { border-color: var(--color-ink); }
+.brief-form input:disabled, .brief-form select:disabled { background: transparent; color: var(--color-ink); opacity: 1; }
 .brief-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.brief-confirm { width: 100%; margin-top: 3px; }
-.stop-action { color: var(--danger); }
-.live-indicator.disabled, .live-indicator.degraded { color: var(--secondary); }
-@media (max-width: 1000px) { .planner-frame, .planner-frame.rail-collapsed { display: grid; grid-template-columns: minmax(0, 1fr) 220px; } }
-@media (max-width: 720px) { .planner-frame, .planner-frame.rail-collapsed { display: block; } }
-.live-indicator.disabled i, .live-indicator.degraded i { background: var(--secondary); }
-.live-indicator.configured { color: #9a6b13; }
-.live-indicator.configured i { background: #c58b1b; }
-@media (max-width: 720px) { .confirm-card dl { grid-template-columns: 1fr; } .confirm-actions { align-items: stretch; flex-direction: column; } }
+.brief-confirm { width: 100%; margin-top: 4px; }
+.summary-tip { margin-top: 24px; padding: 12px; border-radius: var(--radius-control); background: var(--color-surface-strong); color: var(--color-muted); }
+.stop-action { color: var(--color-danger); }
+.live-indicator.disabled, .live-indicator.degraded { color: var(--color-muted); }
+.live-indicator.disabled i, .live-indicator.degraded i { background: var(--color-muted); }
+.live-indicator.configured { color: var(--color-muted); }
+.live-indicator.configured i { background: var(--color-primary); }
+.bulk-dialog-backdrop { position: fixed; z-index: 30; inset: 0; display: grid; place-items: center; padding: 20px; background: rgb(0 0 0 / 50%); }
+.bulk-dialog { width: min(100%, 420px); padding: 28px; border: 1px solid var(--color-border); border-radius: var(--radius-card); background: var(--color-surface); box-shadow: 0 16px 48px rgb(31 45 48 / 22%); }
+.bulk-dialog h2 { margin: 8px 0 10px; font-size: 21px; }
+.bulk-dialog p { margin: 0; color: var(--color-muted); line-height: 1.6; }
+.bulk-dialog label { display: grid; gap: 7px; margin-top: 18px; color: var(--color-ink); font-size: 13px; font-weight: 600; }
+.bulk-dialog input { width: 100%; min-height: 48px; padding: 11px 12px; border: 1px solid var(--color-border); border-radius: var(--radius-control); background: var(--color-surface); color: var(--color-ink); outline: 0; }
+.bulk-dialog input:focus { border-color: var(--color-ink); }
+.bulk-error { margin-top: 12px !important; color: var(--color-danger) !important; font-size: 13px; }
+.bulk-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
+.danger-button { min-height: 42px; padding: 9px 15px; border: 1px solid var(--color-danger); border-radius: var(--radius-control); background: var(--color-danger); color: var(--color-on-primary); }
+.danger-button:hover:not(:disabled) { filter: brightness(.94); }
+@media (max-width: 1128px) { .planner-frame, .planner-frame.rail-collapsed { grid-template-columns: 64px minmax(0, 1fr) 260px; } .planner-frame .session-rail { display: none; } .planner-frame { grid-template-columns: minmax(0, 1fr) 260px; } }
+@media (max-width: 744px) { .planner-frame, .planner-frame.rail-collapsed { display: block; min-height: calc(100vh - 64px); } .conversation-panel { min-height: auto; border: 0; } .planner-header { min-height: 0; padding: 24px 16px; align-items: flex-start; flex-direction: column; } .planner-header h1 { font-size: 21px; } .message-list { max-height: none; min-height: 420px; padding: 24px 16px; } .message-content { max-width: calc(100vw - 76px); } .composer { padding: 16px; } .summary-rail { border-top: 1px solid var(--color-border); padding: 24px 16px; } .bulk-dialog { padding: 22px; } }
+@media (max-width: 520px) { .confirm-card dl { grid-template-columns: 1fr; } .confirm-actions { align-items: stretch; flex-direction: column; } .confirm-actions button { width: 100%; } }
 </style>

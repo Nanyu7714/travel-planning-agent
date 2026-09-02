@@ -36,3 +36,6 @@ Thumbs.db
 .commitmsg.txt
 .logcheck.txt
 .logcheck2.txt
+
+# Local infrastructure notes (must not be committed)
+docs/服务器配置.local.md

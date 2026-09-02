@@ -53,3 +53,37 @@ def test_media_assets_are_grouped_by_city_and_content():
         assert chengdu["image_url"] == ""
         assert chengdu_cover["verification_status"] == "rejected_wrong_city"
         assert chengdu_cover["is_active"] is False
+
+
+def test_admin_can_autofill_review_and_activate_attraction_image(monkeypatch):
+    candidate = {
+        "url": "https://upload.wikimedia.org/example.jpg",
+        "mime_type": "image/jpeg",
+        "alt_text": "景点测试图片",
+        "source_name": "Wikimedia Commons",
+        "source_author": "Example Author",
+        "license_name": "CC BY-SA 4.0",
+        "attribution_url": "https://commons.wikimedia.org/wiki/File:Example.jpg",
+    }
+    monkeypatch.setattr("app.main.search_commons_image", lambda _: candidate)
+    with TestClient(app) as client:
+        login = client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        assert login.status_code == 200
+        headers = {"X-CSRF-Token": client.cookies.get("csrf_token")}
+        assets = client.get("/api/v1/admin/media-assets").json()
+        missing = next(asset for asset in assets if asset["attraction_id"] is not None and asset["verification_status"] == "missing")
+
+        filled = client.post(f"/api/v1/admin/media-assets/{missing['id']}/autofill", json={}, headers=headers)
+        assert filled.status_code == 200
+        assert filled.json()["verification_status"] == "needs_review"
+        assert filled.json()["is_active"] is False
+        assert filled.json()["source_author"] == "Example Author"
+
+        activated = client.patch(
+            f"/api/v1/admin/media-assets/{missing['id']}",
+            json={"verification_status": "approved", "is_active": True},
+            headers=headers,
+        )
+        assert activated.status_code == 200
+        attraction = client.get(f"/api/v1/attractions/{missing['attraction_id']}").json()
+        assert attraction["image_url"] == candidate["url"]

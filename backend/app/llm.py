@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from threading import Lock
 
 import httpx
@@ -7,10 +8,14 @@ from app.core.config import settings
 
 
 _status_lock = Lock()
-_runtime_status = {"state": "configured" if settings.llm_api_key else "disabled", "error": None}
+_runtime_status = {
+    "state": "configured" if settings.llm_api_key else "disabled",
+    "error": None,
+    "last_failure_at": None,
+}
 
 
-def get_llm_status() -> dict:
+def get_llm_status(include_diagnostics: bool = False) -> dict:
     with _status_lock:
         state = _runtime_status["state"]
         if not settings.llm_api_key:
@@ -23,17 +28,38 @@ def get_llm_status() -> dict:
         "connected": "大模型已连接",
         "degraded": "大模型调用失败，已切换本地对话模式",
     }
-    return {
+    payload = {
         "mode": "llm" if settings.llm_api_key else "local",
         "state": state,
         "model": settings.llm_model if settings.llm_api_key else None,
         "label": labels[state],
     }
+    if include_diagnostics:
+        payload["last_error"] = _runtime_status["error"]
+        payload["last_failure_at"] = _runtime_status["last_failure_at"]
+    return payload
 
 
 def _set_status(state: str, error: str | None = None) -> None:
     with _status_lock:
-        _runtime_status.update(state=state, error=error)
+        _runtime_status.update(
+            state=state,
+            error=error,
+            last_failure_at=datetime.now(timezone.utc).isoformat() if error else _runtime_status["last_failure_at"],
+        )
+
+
+def _failure_reason(exc: Exception) -> str:
+    """Return an administrator-safe failure category without request URLs or credentials."""
+    if isinstance(exc, httpx.TimeoutException):
+        return "模型请求超时"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"模型服务返回 HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.RequestError):
+        return "模型服务网络请求失败"
+    if isinstance(exc, (KeyError, IndexError, TypeError, ValueError)):
+        return "模型响应格式无效或为空"
+    return type(exc).__name__
 
 
 def _call_model(system_prompt: str, messages: list[dict], max_tokens: int | None = None) -> str | None:
@@ -61,16 +87,18 @@ def _call_model(system_prompt: str, messages: list[dict], max_tokens: int | None
         _set_status("connected")
         return content
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
-        _set_status("degraded", type(exc).__name__)
+        _set_status("degraded", _failure_reason(exc))
         return None
 
 
 def generate_chat_reply(messages: list[dict], profile: dict) -> str | None:
     system_prompt = (
-        "你是行旅旅游规划助手。请像正常对话一样回应用户，并结合已保存的用户画像。"
-        "不要每轮都追问目的地，不要声称已经生成行程。用户未明确要求规划时，先了解其旅行兴趣、"
-        "饮食偏好、节奏和限制；可以自然地一次追问一个信息。用户明确要求规划时，只提示系统会先整理需求并让用户确认。"
-        "不得编造景点价格、开放时间、距离或交通数据。回复简洁、自然，使用中文。"
+        "你是熟悉中国城市的旅行朋友和本地导游，不是只会收集条件的规划机器人。"
+        "先直接回答用户当前的问题：问美食就介绍吃什么和适合去的街区，问季节就说明何时舒服，问景点就讲亮点和感受。"
+        "语气温暖、自然、有一点画面感，像朋友在出发前给建议；通常用 2 到 4 句，不要重复上一轮内容。"
+        "除非用户明确要求制定行程，否则不要把对话转成规划流程，也不要机械地追问天数和预算。"
+        "可在确实有帮助时只追问一个轻松的问题。不得编造具体店铺、景点价格、开放时间、距离或交通数据。"
+        "回复使用简洁中文。"
         f"\n当前用户画像：{json.dumps(profile, ensure_ascii=False)}"
     )
     return _call_model(system_prompt, messages)

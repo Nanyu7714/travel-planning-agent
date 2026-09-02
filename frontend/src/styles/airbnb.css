@@ -1,20 +1,41 @@
 :root {
-  --bg: #ffffff;
-  --surface: #ffffff;
-  --muted: #f7f7f7;
-  --text: #222222;
-  --secondary: #6a6a6a;
-  --border: #ebebeb;
-  --border-strong: #c1c1c1;
-  --primary: #ff385c;
-  --primary-dark: #e00b41;
-  --primary-soft: #f7f7f7;
-  --accent: #ff385c;
-  --gold: #222222;
-  --danger: #c13515;
-  --success: #6a6a6a;
+  --color-canvas: #ffffff;
+  --color-surface: #ffffff;
+  --color-surface-soft: #f7f7f7;
+  --color-surface-strong: #f2f2f2;
+  --color-ink: #222222;
+  --color-body: #3f3f3f;
+  --color-muted: #6a6a6a;
+  --color-muted-soft: #929292;
+  --color-border: #dddddd;
+  --color-border-soft: #ebebeb;
+  --color-border-strong: #c1c1c1;
+  --color-primary: #ff385c;
+  --color-primary-active: #e00b41;
+  --color-primary-disabled: #ffd1da;
+  --color-danger: #c13515;
+  --color-on-primary: #ffffff;
+  --color-on-dark: #ffffff;
+  --bg: var(--color-canvas);
+  --surface: var(--color-surface);
+  --muted: var(--color-surface-soft);
+  --text: var(--color-ink);
+  --secondary: var(--color-muted);
+  --border: var(--color-border-soft);
+  --border-strong: var(--color-border-strong);
+  --primary: var(--color-primary);
+  --primary-dark: var(--color-primary-active);
+  --primary-soft: var(--color-surface-soft);
+  --accent: var(--color-primary);
+  --gold: var(--color-ink);
+  --danger: var(--color-danger);
+  --success: var(--color-muted);
   --radius: 14px;
-  --airbnb-shadow-hover: rgba(0, 0, 0, 0.02) 0 0 0 1px, rgba(0, 0, 0, 0.04) 0 2px 6px 0, rgba(0, 0, 0, 0.1) 0 4px 8px 0;
+  --radius-card: 14px;
+  --radius-control: 8px;
+  --radius-pill: 9999px;
+  --shadow-hover: rgba(0, 0, 0, 0.02) 0 0 0 1px, rgba(0, 0, 0, 0.04) 0 2px 6px 0, rgba(0, 0, 0, 0.1) 0 4px 8px 0;
+  --airbnb-shadow-hover: var(--shadow-hover);
   font-family: 'Airbnb Cereal VF', Circular, -apple-system, system-ui, Roboto, 'Helvetica Neue', sans-serif;
   color: var(--text);
   background: var(--bg);
@@ -34,6 +55,8 @@ body {
 .nav-shell {
   max-width: 1280px;
   gap: 32px;
+  padding-right: 32px;
+  padding-left: 32px;
 }
 
 .brand {
@@ -334,5 +357,76 @@ input:focus-visible {
 
   .home-intro h1 {
     font-size: 28px;
+  }
+}
+
+.modal-backdrop {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+@media (max-width: 744px) {
+  .topbar {
+    height: 64px;
+  }
+
+  .nav-shell {
+    gap: 12px;
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .nav-links {
+    position: absolute;
+    top: 64px;
+    right: 0;
+    left: 0;
+    display: none;
+    height: auto;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    padding: 8px 16px 16px;
+    border-bottom: 1px solid var(--color-border-soft);
+    background: var(--color-canvas);
+    box-shadow: var(--shadow-hover);
+  }
+
+  .nav-links.open {
+    display: flex;
+  }
+
+  .nav-links a,
+  .nav-links a.router-link-active {
+    height: 48px;
+    justify-content: flex-start;
+    padding: 0 12px;
+    border: 0;
+    border-radius: var(--radius-control);
+  }
+
+  .nav-links a.router-link-active {
+    background: var(--color-surface-soft);
+  }
+
+  .menu-button {
+    display: grid;
+    width: 40px;
+    height: 40px;
+    flex: none;
+    place-items: center;
+    padding: 0;
+    border-radius: var(--radius-pill);
+    background: var(--color-surface-strong);
+    color: var(--color-ink);
+  }
+
+  .menu-button:hover {
+    background: var(--color-border-soft);
+  }
+
+  .login-button {
+    min-height: 40px;
+    padding: 8px 16px;
+    font-size: 14px;
   }
 }

@@ -17,10 +17,15 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
     role: Mapped[str] = mapped_column(String(20), default="user")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    @property
+    def email_verified(self) -> bool:
+        return self.email_verified_at is not None
 
 
 class UserProfile(Base):
@@ -48,6 +53,31 @@ class AuthSession(Base):
     revoked_reason: Mapped[str | None] = mapped_column(String(40))
 
 
+class AuthActionToken(Base):
+    __tablename__ = "auth_action_tokens"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    purpose: Mapped[str] = mapped_column(String(30), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    target_email: Mapped[str | None] = mapped_column(String(255), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class AuthRateLimitBucket(Base):
+    __tablename__ = "auth_rate_limit_buckets"
+    __table_args__ = (UniqueConstraint("action", "scope_type", "scope_hash"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    action: Mapped[str] = mapped_column(String(40), index=True)
+    scope_type: Mapped[str] = mapped_column(String(20))
+    scope_hash: Mapped[str] = mapped_column(String(64))
+    window_started_at: Mapped[datetime] = mapped_column(DateTime)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    blocked_until: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class City(Base):
     __tablename__ = "cities"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -61,6 +91,7 @@ class City(Base):
     image_url: Mapped[str] = mapped_column(String(500))
     support_level: Mapped[str] = mapped_column(String(20), default="full")
     planning_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     attractions: Mapped[list["Attraction"]] = relationship(back_populates="city", cascade="all, delete-orphan")
 
 
@@ -79,6 +110,7 @@ class Attraction(Base):
     longitude: Mapped[float | None]
     image_url: Mapped[str] = mapped_column(String(500))
     source: Mapped[str] = mapped_column(String(200), default="平台核验数据")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     city: Mapped[City] = relationship(back_populates="attractions")
 
 
@@ -143,6 +175,32 @@ class PlanningJob(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("planning_jobs.id"), unique=True, index=True)
+    itinerary_id: Mapped[int | None] = mapped_column(ForeignKey("itineraries.id"), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="running", index=True)
+    algorithm_version: Mapped[str] = mapped_column(String(40), default="tool-agent-v1")
+    input_data: Mapped[dict] = mapped_column(JSON)
+    summary: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class AgentToolCall(Base):
+    __tablename__ = "agent_tool_calls"
+    __table_args__ = (UniqueConstraint("agent_run_id", "sequence"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent_run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    tool_name: Mapped[str] = mapped_column(String(80))
+    input_data: Mapped[dict] = mapped_column(JSON)
+    output_data: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(30), default="completed")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class IdempotencyRecord(Base):
     __tablename__ = "idempotency_records"
     __table_args__ = (UniqueConstraint("user_id", "session_id", "action", "key"),)
@@ -179,6 +237,7 @@ class Itinerary(Base):
     budget_scope: Mapped[str] = mapped_column(String(120), default="门票、市内交通和餐饮估算")
     preferences: Mapped[list] = mapped_column(JSON, default=list)
     lock_version: Mapped[int] = mapped_column(Integer, default=1)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     itinerary_days: Mapped[list["ItineraryDay"]] = relationship(cascade="all, delete-orphan")
 
@@ -244,6 +303,73 @@ class ItineraryStop(Base):
     note: Mapped[str] = mapped_column(String(255), default="")
 
 
+class CommunityPost(Base):
+    __tablename__ = "community_posts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    itinerary_id: Mapped[int | None] = mapped_column(ForeignKey("itineraries.id"), index=True)
+    itinerary_snapshot: Mapped[dict] = mapped_column(JSON)
+    city_name: Mapped[str] = mapped_column(String(80), index=True)
+    title: Mapped[str] = mapped_column(String(120))
+    body: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class CommunityPostImage(Base):
+    __tablename__ = "community_post_images"
+    __table_args__ = (UniqueConstraint("post_id", "sort_order"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    post_id: Mapped[int] = mapped_column(ForeignKey("community_posts.id"), index=True)
+    storage_path: Mapped[str] = mapped_column(String(500))
+    mime_type: Mapped[str] = mapped_column(String(80))
+    alt_text: Mapped[str] = mapped_column(String(240), default="")
+    sort_order: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class CommunityPostLike(Base):
+    __tablename__ = "community_post_likes"
+    __table_args__ = (UniqueConstraint("user_id", "post_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    post_id: Mapped[int] = mapped_column(ForeignKey("community_posts.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class CommunityPostFavorite(Base):
+    __tablename__ = "community_post_favorites"
+    __table_args__ = (UniqueConstraint("user_id", "post_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    post_id: Mapped[int] = mapped_column(ForeignKey("community_posts.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class CommunityComment(Base):
+    __tablename__ = "community_comments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    post_id: Mapped[int] = mapped_column(ForeignKey("community_posts.id"), index=True)
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    body: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class ContentReport(Base):
+    __tablename__ = "content_reports"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reporter_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    target_type: Mapped[str] = mapped_column(String(20), index=True)
+    target_id: Mapped[int] = mapped_column(Integer, index=True)
+    reason: Mapped[str] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(20), default="open", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class Favorite(Base):
     __tablename__ = "favorites"
     __table_args__ = (UniqueConstraint("user_id", "target_type", "target_id"),)
@@ -261,3 +387,31 @@ class RecentView(Base):
     target_type: Mapped[str] = mapped_column(String(20))
     target_id: Mapped[int] = mapped_column(Integer)
     viewed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class RankingEntry(Base):
+    __tablename__ = "ranking_entries"
+    __table_args__ = (UniqueConstraint("ranking_type", "city_id", "attraction_id", name="uq_ranking_entry_target"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ranking_type: Mapped[str] = mapped_column(String(20), index=True)
+    city_id: Mapped[int | None] = mapped_column(ForeignKey("cities.id"), index=True)
+    attraction_id: Mapped[int | None] = mapped_column(ForeignKey("attractions.id"), index=True)
+    rank: Mapped[int] = mapped_column(Integer)
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    reason: Mapped[str] = mapped_column(String(255), default="管理员维护")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class AdminAuditLog(Base):
+    __tablename__ = "admin_audit_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actor_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    actor_username: Mapped[str] = mapped_column(String(50))
+    action: Mapped[str] = mapped_column(String(40), index=True)
+    target_type: Mapped[str] = mapped_column(String(40), index=True)
+    target_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    summary: Mapped[str] = mapped_column(String(255))
+    payload: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)

@@ -22,11 +22,16 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
-def create_access_token(user_id: int, role: str) -> str:
+def password_needs_rehash(hashed: str) -> bool:
+    return password_hasher.check_needs_rehash(hashed)
+
+
+def create_access_token(user_id: int, role: str, session_id: int) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
         "role": role,
+        "sid": str(session_id),
         "iat": now,
         "exp": now + timedelta(minutes=settings.access_token_minutes),
     }

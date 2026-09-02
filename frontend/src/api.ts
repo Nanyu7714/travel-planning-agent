@@ -32,8 +32,8 @@ function validationMessage(field: string, issue: ValidationIssue) {
   if (field === 'email') return '邮箱格式不正确，请输入类似 name@example.com 的地址'
   if (field === 'username' && issue.type?.includes('too_short')) return '用户名至少输入 2 个字符'
   if (field === 'username' && issue.type?.includes('too_long')) return '用户名不能超过 50 个字符'
-  if (field === 'password' && issue.type?.includes('too_short')) return '密码至少输入 6 个字符'
-  if (field === 'password' && issue.type?.includes('too_long')) return '密码不能超过 128 个字符'
+  if ((field === 'password' || field === 'new_password') && issue.type?.includes('too_short')) return '密码至少输入 10 个字符'
+  if ((field === 'password' || field === 'new_password') && issue.type?.includes('too_long')) return '密码不能超过 128 个字符'
   return issue.msg === 'Field required' ? '此项不能为空' : '输入内容不符合要求'
 }
 
@@ -51,12 +51,13 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   const method = options.method || 'GET'
   const send = () => {
     const headers = new Headers(options.headers)
-    headers.set('Content-Type', 'application/json')
+    if (!(options.body instanceof FormData)) headers.set('Content-Type', 'application/json')
     if (method !== 'GET') headers.set('X-CSRF-Token', csrfToken())
     return fetch(apiUrl(path), { ...options, headers, credentials: 'include' })
   }
   let response = await send()
-  const canRefresh = !['/auth/login', '/auth/register', '/auth/refresh'].includes(path)
+  const publicAuthPaths = ['/auth/login', '/auth/register', '/auth/refresh', '/auth/verify-email', '/auth/resend-verification', '/auth/forgot-password', '/auth/reset-password', '/auth/change-email/confirm']
+  const canRefresh = !publicAuthPaths.includes(path)
   if (response.status === 401 && canRefresh) {
     if (await refreshSession()) response = await send()
     else if (path !== '/auth/me') window.dispatchEvent(new Event('auth-expired'))
@@ -79,13 +80,19 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   return response.json()
 }
 
-export type City = { id: number; slug: string; name: string; description: string; season: string; budget: string; recommended_days: string; image_url: string; support_level: string; planning_enabled: boolean }
-export type Attraction = { id: number; city_id: number; name: string; description: string; tags: string[]; opening_hours: string; ticket_price: number; duration_minutes: number; area: string; image_url: string; source: string }
+export type City = { id: number; slug: string; name: string; description: string; season: string; budget: string; recommended_days: string; image_url: string; support_level: string; planning_enabled: boolean; is_active: boolean }
+export type Attraction = { id: number; city_id: number; name: string; description: string; tags: string[]; opening_hours: string; ticket_price: number; duration_minutes: number; area: string; image_url: string; source: string; is_active: boolean }
 export type Ranking = { rank: number; attraction_id?: number; city_id?: number; name: string; score: number; reason: string; data_source?: string }
 export type UserProfile = { display_name: string | null; preferences: string[]; avoid_places: string[] }
 export type FavoriteItem = { target_type: 'city' | 'attraction' | 'itinerary'; target_id: number; name: string; description: string; image_url: string; city_id?: number }
 export type RecentView = FavoriteItem & { viewed_at: string }
 export type Itinerary = { id: number; title: string; city_name: string; days: number; status: string; budget_total: number; budget_scope: string; preferences: string[]; lock_version: number; validation?: Record<string, unknown>; itinerary_days: { day_number: number; title: string; stops: { id: number; attraction_id?: number; name: string; start_time: string; end_time: string; note: string }[] }[] }
+export type AgentRun = { id: number; status: string; algorithm_version: string; input: Record<string, unknown>; summary: { selected_count?: number; requested_stop_count?: number; budget_repair_applied?: boolean; ticket_estimate?: number } | null; created_at: string; steps: { sequence: number; tool_name: string; input: Record<string, unknown>; output: Record<string, unknown>; status: string }[] }
+export type MediaAsset = { id: number; city_id: number; attraction_id: number | null; purpose: string; content_key: string; storage_type: 'remote_url' | 'local_file' | 'object_storage'; url: string | null; storage_path: string | null; mime_type: string | null; alt_text: string; source_name: string | null; source_author: string | null; license_name: string | null; attribution_url: string | null; verification_status: 'approved' | 'needs_review' | 'missing' | 'rejected_wrong_city'; is_active: boolean }
+export type SessionBulkAction = 'archive' | 'restore' | 'delete'
+export type CommunityComment = { id: number; body: string; created_at: string; author: { id: number; name: string }; can_manage: boolean }
+export type CommunityPost = { id: number; title: string; body: string; city_name: string; status: 'published' | 'hidden'; created_at: string; updated_at: string; author: { id: number; name: string }; itinerary: { title: string; city_name: string; days: number; budget_total: number; preferences: string[]; itinerary_days: { day_number: number; title: string; stops: { name: string; start_time: string; end_time: string }[] }[] }; images: { id: number; url: string; alt_text: string }[]; like_count: number; favorite_count: number; comment_count: number; liked: boolean; favorited: boolean; can_manage: boolean; comments?: CommunityComment[] }
+export type AuthAction = { message: string; dev_action_url?: string | null }
 
 export async function getCities() { return api<City[]>('/cities') }
 export async function searchCities(query: string) { return api<City[]>(`/cities/search?q=${encodeURIComponent(query)}`) }
@@ -100,9 +107,16 @@ export async function updateUserProfile(profile: UserProfile) { return api<UserP
 export async function getFavorites() { return api<FavoriteItem[]>('/favorites') }
 export async function setFavorite(type: 'city' | 'attraction' | 'itinerary', id: number, active: boolean) { return api(`/favorites/${type}/${id}`, { method: active ? 'PUT' : 'DELETE', body: active ? '{}' : undefined }) }
 export async function getRecentViews() { return api<RecentView[]>('/recent-views') }
+export async function bulkUpdateSessions(sessionIds: number[], action: SessionBulkAction, password?: string) {
+  return api<{ processed_count: number; action: SessionBulkAction }>('/sessions/bulk', { method: 'POST', body: JSON.stringify({ session_ids: sessionIds, action, password }) })
+}
 export async function clearRecentViews() { return api('/recent-views', { method: 'DELETE', body: '{}' }) }
 export async function recordRecentView(type: 'city' | 'attraction', id: number) { return api(`/recent-views?target_type=${type}&target_id=${id}`, { method: 'POST', body: '{}' }) }
 export async function getItinerary(id: number) { return api<Itinerary>(`/itineraries/${id}`) }
+export async function getItineraryAgentRun(id: number) { return api<AgentRun>(`/itineraries/${id}/agent-run`) }
+export async function getAdminMediaAssets(cityId?: number, status?: string) { const params = new URLSearchParams(); if (cityId) params.set('city_id', String(cityId)); if (status) params.set('verification_status', status); return api<MediaAsset[]>(`/admin/media-assets?${params.toString()}`) }
+export async function autofillMediaAsset(id: number) { return api<MediaAsset>(`/admin/media-assets/${id}/autofill`, { method: 'POST', body: '{}' }) }
+export async function updateMediaAsset(id: number, body: Partial<MediaAsset>) { return api<MediaAsset>(`/admin/media-assets/${id}`, { method: 'PATCH', body: JSON.stringify(body) }) }
 export async function updateItinerary(id: number, body: Record<string, unknown>) { return api<Itinerary>(`/itineraries/${id}`, { method: 'PUT', body: JSON.stringify(body) }) }
 export async function replanItinerary(id: number, instruction: string) { return api<Itinerary>(`/itineraries/${id}/replan`, { method: 'POST', body: JSON.stringify({ instruction }) }) }
 export async function getItineraryRevisions(id: number) { return api<{ id: number; version_no: number; reason: string; created_at: string }[]>(`/itineraries/${id}/revisions`) }
@@ -110,8 +124,25 @@ export async function restoreItineraryRevision(id: number, version: number) { re
 export async function createShare(id: number, expires_days = 30) { return api<{ id: number; share_url: string; expires_at: string }>(`/itineraries/${id}/shares`, { method: 'POST', body: JSON.stringify({ expires_days }) }) }
 export async function saveFeedback(id: number, rating: number, comment: string) { return api(`/itineraries/${id}/feedback`, { method: 'PUT', body: JSON.stringify({ rating, comment }) }) }
 export async function getFeedback(id: number) { return api<{ rating: number | null; comment: string; average: number | null; count: number }>(`/itineraries/${id}/feedback`) }
+export async function getCommunityPosts(city = '', page = 1) { const params = new URLSearchParams({ page: String(page) }); if (city) params.set('city', city); return api<{ items: CommunityPost[]; total: number; page: number; page_size: number }>(`/community/posts?${params.toString()}`) }
+export async function getMyCommunityPosts() { return api<CommunityPost[]>('/community/me/posts') }
+export async function getCommunityPost(id: number) { return api<CommunityPost>(`/community/posts/${id}`) }
+export async function createCommunityPost(body: { itinerary_id: number; title: string; body: string }) { return api<CommunityPost>('/community/posts', { method: 'POST', body: JSON.stringify(body) }) }
+export async function updateCommunityPost(id: number, body: { title: string; body: string }) { return api<CommunityPost>(`/community/posts/${id}`, { method: 'PATCH', body: JSON.stringify(body) }) }
+export async function withdrawCommunityPost(id: number) { return api(`/community/posts/${id}`, { method: 'DELETE', body: '{}' }) }
+export async function uploadCommunityImages(id: number, files: File[]) { const form = new FormData(); files.forEach((file) => form.append('files', file)); return api<{ id: number; url: string; alt_text: string }[]>(`/community/posts/${id}/images`, { method: 'POST', body: form }) }
+export async function setCommunityLike(id: number, active: boolean) { return api(`/community/posts/${id}/like`, { method: active ? 'PUT' : 'DELETE', body: active ? '{}' : undefined }) }
+export async function setCommunityFavorite(id: number, active: boolean) { return api(`/community/posts/${id}/favorite`, { method: active ? 'PUT' : 'DELETE', body: active ? '{}' : undefined }) }
+export async function createCommunityComment(id: number, body: string) { return api<CommunityComment>(`/community/posts/${id}/comments`, { method: 'POST', body: JSON.stringify({ body }) }) }
+export async function reportCommunityContent(target_type: 'post' | 'comment' | 'image', target_id: number, reason: string) { return api('/community/reports', { method: 'POST', body: JSON.stringify({ target_type, target_id, reason }) }) }
 export async function getAuthSessions() { return api<{ id: number; device_name: string | null; created_at: string; last_used_at: string; expires_at: string; current: boolean }[]>('/auth/sessions') }
 export async function revokeAuthSession(id: number) { return api(`/auth/sessions/${id}`, { method: 'DELETE' }) }
 export async function changePassword(current_password: string, new_password: string) { return api('/auth/change-password', { method: 'POST', body: JSON.stringify({ current_password, new_password }) }) }
-export async function changeEmail(password: string, email: string) { return api('/auth/me/email', { method: 'PATCH', body: JSON.stringify({ password, email }) }) }
+export async function registerAccount(username: string, email: string, password: string) { return api<AuthAction>('/auth/register', { method: 'POST', body: JSON.stringify({ username, email, password }) }) }
+export async function verifyEmail(token: string) { return api<AuthAction>('/auth/verify-email', { method: 'POST', body: JSON.stringify({ token }) }) }
+export async function resendVerification(email: string) { return api<AuthAction>('/auth/resend-verification', { method: 'POST', body: JSON.stringify({ email }) }) }
+export async function forgotPassword(email: string) { return api<AuthAction>('/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email }) }) }
+export async function resetPassword(token: string, new_password: string) { return api('/auth/reset-password', { method: 'POST', body: JSON.stringify({ token, new_password }) }) }
+export async function changeEmail(password: string, email: string) { return api<AuthAction>('/auth/change-email', { method: 'POST', body: JSON.stringify({ password, email }) }) }
+export async function confirmEmailChange(token: string) { return api<AuthAction>('/auth/change-email/confirm', { method: 'POST', body: JSON.stringify({ token }) }) }
 export async function logoutAllDevices() { return api('/auth/logout-all', { method: 'POST', body: '{}' }) }
