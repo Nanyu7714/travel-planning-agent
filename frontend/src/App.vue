@@ -10,6 +10,7 @@ const menuOpen = ref(false)
 const profileMenuOpen = ref(false)
 type CurrentUser = { id: number; public_id: string; username: string; email: string; email_verified: boolean; role: string }
 const account = ref<CurrentUser | null>(null)
+const authReady = ref(false)
 const loginOpen = ref(false)
 const authSubmitting = ref(false)
 const authCloseButton = ref<HTMLButtonElement | null>(null)
@@ -23,7 +24,13 @@ const pageTitle = computed(() => route.path === '/planner' ? 'AI 规划' : route
 const isEntryPage = computed(() => route.name === 'entry')
 
 async function loadUser() {
-  account.value = await api<CurrentUser>('/auth/me').catch(() => null)
+  try {
+    account.value = await api<CurrentUser>('/auth/me')
+  } catch {
+    account.value = null
+  } finally {
+    authReady.value = true
+  }
 }
 function handleAuthExpired() {
   account.value = null
@@ -55,6 +62,7 @@ async function login() {
       await router.push({ name: 'auth-verify', query: { email: registrationEmail } })
     } else {
       account.value = await api<CurrentUser>('/auth/login', { method: 'POST', body: JSON.stringify(form.value) })
+      authReady.value = true
       loginOpen.value = false
       if (route.path === '/') router.push('/planner')
     }
@@ -92,7 +100,8 @@ onBeforeUnmount(() => { window.removeEventListener('auth-expired', handleAuthExp
       </nav>
       <div class="nav-actions">
         <div v-if="account" class="profile-menu-wrap"><button class="account-name" title="打开用户菜单" :aria-expanded="profileMenuOpen" @click="profileMenuOpen = !profileMenuOpen"><UserRound :size="16" /><span>{{ account.username }}</span></button><div v-if="profileMenuOpen" class="profile-menu" role="menu"><RouterLink to="/me" role="menuitem" @click="profileMenuOpen = false">用户主页</RouterLink><RouterLink to="/community?mine=1" role="menuitem" @click="profileMenuOpen = false">我的发布</RouterLink><RouterLink to="/me/settings/security" role="menuitem" @click="profileMenuOpen = false">账号安全</RouterLink><button role="menuitem" @click="logout">退出登录</button></div></div>
-        <button v-else class="login-button" @click="loginOpen = true"><LogIn :size="16" />登录</button>
+        <button v-else-if="authReady" class="login-button" @click="loginOpen = true"><LogIn :size="16" />登录</button>
+        <span v-else class="auth-action-placeholder" aria-hidden="true"></span>
         <button class="menu-button" aria-label="打开菜单" @click="menuOpen = !menuOpen"><X v-if="menuOpen" :size="20" /><Menu v-else :size="20" /></button>
       </div>
     </div>
@@ -128,6 +137,7 @@ onBeforeUnmount(() => { window.removeEventListener('auth-expired', handleAuthExp
 
 <style>
 .profile-menu-wrap { position: relative; }
+.auth-action-placeholder { display: block; width: 86px; min-height: 40px; }
 .profile-menu-wrap > .account-name { min-height: 40px; padding: 8px 12px; border: 1px solid var(--color-border); border-radius: var(--radius-pill); background: var(--color-surface); color: var(--color-ink); cursor: pointer; }
 .profile-menu-wrap > .account-name:hover, .profile-menu-wrap > .account-name[aria-expanded="true"] { border-color: var(--color-ink); }
 .profile-menu { position: absolute; z-index: 30; top: 48px; right: 0; min-width: 168px; padding: 8px; border: 1px solid var(--color-border); border-radius: var(--radius-card); background: var(--color-surface); box-shadow: var(--shadow-hover); }
