@@ -1,4 +1,5 @@
 import os
+import secrets
 import shutil
 import tempfile
 from pathlib import Path
@@ -8,12 +9,16 @@ import pytest
 
 
 _ORIGINAL_DATABASE_URL = os.environ.get("DATABASE_URL")
+_ORIGINAL_MAIL_DELIVERY_MODE = os.environ.get("MAIL_DELIVERY_MODE")
 _TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="travel-agent-tests-"))
 _TEST_DB_PATH = _TEST_DB_DIR / "test.db"
 _TEST_DATABASE_URL = f"sqlite:///{_TEST_DB_PATH.as_posix()}"
 
 # This must run before test modules import app.db and create the SQLAlchemy engine.
 os.environ["DATABASE_URL"] = _TEST_DATABASE_URL
+os.environ["MAIL_DELIVERY_MODE"] = "console"
+ADMIN_INITIAL_PASSWORD = secrets.token_urlsafe(24)
+os.environ["ADMIN_INITIAL_PASSWORD"] = ADMIN_INITIAL_PASSWORD
 
 
 @pytest.fixture(autouse=True)
@@ -23,6 +28,7 @@ def disable_external_llm(monkeypatch):
     if settings.database_url != _TEST_DATABASE_URL:
         raise RuntimeError(f"Tests must use the isolated database: {_TEST_DATABASE_URL}")
     monkeypatch.setattr(settings, "llm_api_key", None)
+    monkeypatch.setattr(settings, "amap_web_service_key", None)
     yield
 
     from sqlalchemy import delete
@@ -40,13 +46,21 @@ def action_token(response) -> str:
     return parse_qs(urlsplit(action_url).query)["token"][0]
 
 
+def verification_code(response) -> str:
+    code = response.json().get("dev_verification_code")
+    assert code and len(code) == 6 and code.isdigit()
+    return code
+
+
 def register_and_login(client, username: str, email: str, password: str = "test123456"):
     registered = client.post(
         "/api/v1/auth/register",
         json={"username": username, "email": email, "password": password},
     )
     assert registered.status_code == 202
-    verified = client.post("/api/v1/auth/verify-email", json={"token": action_token(registered)})
+    sent = client.post("/api/v1/auth/send-verification-code", json={"email": email})
+    assert sent.status_code == 202
+    verified = client.post("/api/v1/auth/verify-email", json={"email": email, "code": verification_code(sent)})
     assert verified.status_code == 200
     logged_in = client.post("/api/v1/auth/login", json={"account": username, "password": password})
     assert logged_in.status_code == 200
@@ -64,3 +78,7 @@ def pytest_sessionfinish(session, exitstatus):
         os.environ.pop("DATABASE_URL", None)
     else:
         os.environ["DATABASE_URL"] = _ORIGINAL_DATABASE_URL
+    if _ORIGINAL_MAIL_DELIVERY_MODE is None:
+        os.environ.pop("MAIL_DELIVERY_MODE", None)
+    else:
+        os.environ["MAIL_DELIVERY_MODE"] = _ORIGINAL_MAIL_DELIVERY_MODE

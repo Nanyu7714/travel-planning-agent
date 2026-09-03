@@ -23,11 +23,11 @@ from app.core.config import settings
 from app.core.security import create_access_token, decode_access_token, hash_password, new_csrf_token, new_refresh_token, password_needs_rehash, token_hash, verify_password
 from app.db import Base, SessionLocal, engine, get_db
 from app.llm import get_llm_status
-from app.mail import AuthMail, MailDeliveryError, send_auth_mail
-from app.media import search_commons_image
-from app.models import AdminAuditLog, AgentEvent, AgentRun, AgentToolCall, Attraction, AuthActionToken, AuthRateLimitBucket, AuthSession, ChatMessage, ChatSession, City, CommunityComment, CommunityPost, CommunityPostFavorite, CommunityPostImage, CommunityPostLike, ContentReport, Favorite, IdempotencyRecord, Itinerary, ItineraryDay, ItineraryFeedback, ItineraryRevision, ItineraryStop, ItineraryValidation, MediaAsset, PlanningJob, RankingEntry, RecentView, ShareLink, User, UserProfile
-from app.schemas import AccountDeleteIn, AdminAttractionCreateIn, AdminAttractionImportIn, AdminAttractionOut, AdminAttractionUpdateIn, AdminAuditLogOut, AdminAuditLogPageOut, AdminCityCreateIn, AdminCityImportIn, AdminCityOut, AdminCityUpdateIn, AdminFeedbackOut, AdminFeedbackPageOut, AdminItineraryOut, AdminItineraryPageOut, AdminRankingCreateIn, AdminRankingImportIn, AdminRankingOut, AdminRankingUpdateIn, AdminSessionOut, AdminSessionPageOut, AdminUserOut, AdminUserPageOut, AdminUserUpdateIn, AttractionOut, AuthActionOut, AuthSessionOut, AuthTokenIn, CityOut, CommunityCommentCreateIn, CommunityPostCreateIn, CommunityPostUpdateIn, CommunityStatusUpdateIn, ContentReportCreateIn, ContentReportStatusUpdateIn, EmailChangeIn, EmailRequestIn, FeedbackIn, FeedbackOut, ItineraryRevisionOut, ItineraryUpdateIn, LoginIn, MediaAssetOut, MediaAssetUpdateIn, MessageIn, MessageOut, PasswordChangeIn, PasswordResetIn, PlanConfirmIn, RegisterIn, ReplanIn, SessionBulkUpdateIn, SessionOut, SessionUpdateIn, ShareCreateIn, ShareOut, UserOut, UserProfileOut, UserProfileUpdateIn
-from app.services import CITY_NAMES, confirmation_message, itinerary_dict, latest_confirmation, process_job_async
+from app.mail import AuthMail, MailDeliveryError, action_email_html, send_auth_mail, verification_email_html
+from app.media import collect_photo_candidates, download_image, sanitize_image_bytes, search_amap_place, search_commons_image
+from app.models import AdminAuditLog, AgentEvent, AgentRun, AgentToolCall, Attraction, AuthActionToken, AuthRateLimitBucket, AuthSession, ChatMessage, ChatSession, City, CommunityComment, CommunityPost, CommunityPostFavorite, CommunityPostImage, CommunityPostLike, ContentReport, EmailOutbox, Favorite, IdempotencyRecord, Itinerary, ItineraryDay, ItineraryFeedback, ItineraryRevision, ItineraryStop, ItineraryValidation, KnowledgeChunk, KnowledgeDocument, MediaAsset, PlanningJob, RankingEntry, RecentView, ShareLink, User, UserProfile
+from app.schemas import AccountDeleteIn, AdminAttractionCreateIn, AdminAttractionImportIn, AdminAttractionOut, AdminAttractionUpdateIn, AdminAuditLogOut, AdminAuditLogPageOut, AdminCityCreateIn, AdminCityImportIn, AdminCityOut, AdminCityUpdateIn, AdminEmailOutboxOut, AdminEmailOutboxPageOut, AdminFeedbackOut, AdminFeedbackPageOut, AdminFeedbackUpdateIn, AdminItineraryOut, AdminItineraryPageOut, AdminKnowledgeDocumentOut, AdminPhotoFetchIn, AdminPhotoFetchOut, AdminRankingCreateIn, AdminRankingImportIn, AdminRankingOut, AdminRankingUpdateIn, AdminSessionOut, AdminSessionPageOut, AdminUserOut, AdminUserPageOut, AdminUserUpdateIn, AttractionOut, AuthActionOut, AuthSessionOut, AuthTokenIn, CityOut, CommunityCommentCreateIn, CommunityPostCreateIn, CommunityPostUpdateIn, CommunityStatusUpdateIn, ContentReportCreateIn, ContentReportStatusUpdateIn, EmailChangeIn, EmailRequestIn, EmailVerificationIn, FeedbackIn, FeedbackOut, ItineraryRevisionOut, ItineraryUpdateIn, KnowledgeDocumentIn, KnowledgeDocumentUpdateIn, LoginIn, MediaAssetBulkUpdateIn, MediaAssetOut, MediaAssetUpdateIn, MessageIn, MessageOut, PasswordChangeIn, PasswordResetIn, PlanConfirmIn, RegisterIn, ReplanIn, SessionBulkUpdateIn, SessionOut, SessionUpdateIn, ShareCreateIn, ShareOut, UserOut, UserProfileOut, UserProfileUpdateIn
+from app.services import CITY_NAMES, confirmation_message, itinerary_dict, latest_confirmation, process_job_async, rebuild_knowledge_chunks, search_guide_knowledge
 
 
 @asynccontextmanager
@@ -39,6 +39,7 @@ async def lifespan(_: FastAPI):
     ensure_itinerary_columns()
     ensure_session_management_columns()
     ensure_content_status_columns()
+    ensure_feedback_workflow_columns()
     seed_database()
     backfill_user_public_ids()
     backfill_session_titles()
@@ -148,11 +149,32 @@ def ensure_content_status_columns() -> None:
             connection.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_is_active ON {table} (is_active)"))
 
 
+def ensure_feedback_workflow_columns() -> None:
+    """Add feedback workflow fields for development databases created before the inbox workflow."""
+    columns = {column["name"] for column in inspect(engine).get_columns("itinerary_feedback")}
+    timestamp_type = "TIMESTAMP" if engine.dialect.name == "postgresql" else "DATETIME"
+    additions = {
+        "status": "VARCHAR(20) NOT NULL DEFAULT 'open'",
+        "assigned_admin_id": "INTEGER",
+        "admin_reply": "TEXT",
+        "replied_at": timestamp_type,
+        "handled_at": timestamp_type,
+    }
+    with engine.begin() as connection:
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(text(f"ALTER TABLE itinerary_feedback ADD COLUMN {name} {definition}"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_itinerary_feedback_status ON itinerary_feedback (status)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_itinerary_feedback_assigned_admin_id ON itinerary_feedback (assigned_admin_id)"))
+
+
 def seed_database() -> None:
     db = SessionLocal()
     try:
         if not db.scalar(select(User).where(User.username == "admin")):
-            db.add(User(username="admin", email="admin@travel.local", password_hash=hash_password("123456"), role="admin", email_verified_at=datetime.now(timezone.utc).replace(tzinfo=None)))
+            if not settings.admin_initial_password:
+                raise RuntimeError("ADMIN_INITIAL_PASSWORD must be configured before creating the initial administrator")
+            db.add(User(username="admin", email="admin@travel.local", password_hash=hash_password(settings.admin_initial_password), role="admin", email_verified_at=datetime.now(timezone.utc).replace(tzinfo=None)))
         if not db.scalar(select(City)):
             cities = [
                 City(slug="beijing", name="北京", aliases=["北京市"], description="古都人文与现代城市交织，适合第一次深度认识中国北方。", season="春秋最佳，四季皆有看点", budget="¥300-600/天", recommended_days="3-5天", image_url="https://images.unsplash.com/photo-1508804185872-d7badad00f7d?auto=format&fit=crop&w=1200&q=80"),
@@ -211,30 +233,48 @@ def sync_media_catalog(db: Session) -> None:
     cities = list(db.scalars(select(City).order_by(City.id)))
     for city in cities:
         definition = city_media.get(city.slug)
-        if not definition:
-            continue
         asset = db.scalar(select(MediaAsset).where(
             MediaAsset.city_id == city.id,
             MediaAsset.attraction_id.is_(None),
             MediaAsset.purpose == "city_cover",
         ))
-        values = {
-            "content_key": f"{city.slug}:city:cover",
-            "storage_type": "remote_url",
-            "url": definition["url"],
-            "storage_path": None,
-            "mime_type": "image/jpeg",
-            "alt_text": definition["alt_text"],
-            "source_name": "Unsplash",
-            "source_author": None,
-            "license_name": "Unsplash License",
-            "attribution_url": f"https://unsplash.com/photos/{definition['photo_id']}",
-            "verification_status": definition["status"],
-            "is_active": definition["active"],
-        }
         if asset is None:
-            asset = MediaAsset(city_id=city.id, attraction_id=None, purpose="city_cover", **values)
-            db.add(asset)
+            if definition:
+                asset = MediaAsset(
+                    city_id=city.id, attraction_id=None, purpose="city_cover",
+                    content_key=f"{city.slug}:city:cover",
+                    storage_type="remote_url",
+                    url=definition["url"],
+                    storage_path=None,
+                    mime_type="image/jpeg",
+                    alt_text=definition["alt_text"],
+                    source_name="Unsplash",
+                    source_author=None,
+                    license_name="Unsplash License",
+                    attribution_url=f"https://unsplash.com/photos/{definition['photo_id']}",
+                    verification_status=definition["status"],
+                    is_active=definition["active"],
+                )
+                db.add(asset)
+            else:
+                # City without a curated source: create an empty cover slot so
+                # admins can autofill or upload an image from the media page.
+                asset = MediaAsset(
+                    city_id=city.id, attraction_id=None, purpose="city_cover",
+                    content_key=f"{city.slug}:city:cover",
+                    storage_type="remote_url",
+                    url=None,
+                    storage_path=None,
+                    mime_type=None,
+                    alt_text=f"{city.name}城市封面",
+                    source_name=None,
+                    source_author=None,
+                    license_name=None,
+                    attribution_url=None,
+                    verification_status="missing",
+                    is_active=False,
+                )
+                db.add(asset)
         elif asset.verification_status == "approved" and not asset.source_author:
             asset.verification_status = "needs_review"
         city.image_url = asset.url if asset.is_active and asset.url else ""
@@ -360,6 +400,7 @@ AUTH_RATE_RULES = {
     "change_email": (3600, 5, 30),
     "confirm_email_change": (900, 10, 40),
 }
+VERIFICATION_RESEND_COOLDOWN_SECONDS = 60
 
 
 def ensure_public_origin(request: Request) -> None:
@@ -426,6 +467,112 @@ def clear_auth_account_rate_limit(db: Session, action: str, account_key: str) ->
     db.commit()
 
 
+def mask_email(email: str) -> str:
+    local, domain = email.split("@", 1)
+    if len(local) <= 2:
+        masked_local = f"{local[:1]}*"
+    elif len(local) <= 4:
+        masked_local = f"{local[:1]}{'*' * (len(local) - 2)}{local[-1:]}"
+    else:
+        masked_local = f"{local[:2]}{'*' * (len(local) - 4)}{local[-2:]}"
+    return f"{masked_local}@{domain}"
+
+
+def email_recipient_fingerprint(email: str) -> str:
+    return hmac.new(
+        settings.csrf_secret.encode("utf-8"),
+        email.strip().lower().encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def send_tracked_auth_mail(db: Session, user: User, purpose: str, message: AuthMail) -> None:
+    """Persist only delivery metadata; mail content and one-time credentials stay out of the outbox."""
+    delivery = EmailOutbox(
+        user_id=user.id,
+        purpose=purpose,
+        recipient_fingerprint=email_recipient_fingerprint(message.recipient),
+        recipient_masked=mask_email(message.recipient),
+        subject=message.subject,
+        status="pending",
+    )
+    db.add(delivery)
+    db.commit()
+    try:
+        result = send_auth_mail(message)
+    except MailDeliveryError as exc:
+        delivery.status = "failed"
+        delivery.attempt_count = exc.attempt_count
+        delivery.retry_count = max(0, exc.attempt_count - 1)
+        delivery.last_error_code = exc.code[:80]
+        db.commit()
+        raise
+
+    delivery.status = result.status
+    delivery.attempt_count = result.attempt_count
+    delivery.retry_count = max(0, result.attempt_count - 1)
+    delivery.last_error_code = None
+    delivery.sent_at = datetime.now(timezone.utc).replace(tzinfo=None) if result.status == "sent" else None
+    db.commit()
+
+
+def verification_retry_after(db: Session, user_id: int) -> int:
+    latest = db.scalar(select(AuthActionToken).where(
+        AuthActionToken.user_id == user_id,
+        AuthActionToken.purpose == "verify_email",
+        AuthActionToken.used_at.is_(None),
+    ).order_by(AuthActionToken.created_at.desc()))
+    if latest is None:
+        return 0
+    elapsed = (datetime.now(timezone.utc).replace(tzinfo=None) - latest.created_at).total_seconds()
+    return max(0, int(VERIFICATION_RESEND_COOLDOWN_SECONDS - elapsed + 0.999))
+
+
+def verification_response(email: str, dev_verification_code: str | None) -> dict:
+    masked = mask_email(email)
+    return {
+        "message": f"如果该邮箱需要验证，验证码已发送至 {masked}，验证码 {settings.email_verification_code_minutes} 分钟内有效；60 秒后可以重新发送。",
+        "dev_verification_code": dev_verification_code,
+        "masked_email": masked,
+        "expires_in_seconds": settings.email_verification_code_minutes * 60,
+        "retry_after_seconds": VERIFICATION_RESEND_COOLDOWN_SECONDS,
+    }
+
+
+def issue_email_verification_code(db: Session, user: User, target_email: str) -> str | None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.execute(update(AuthActionToken).where(
+        AuthActionToken.user_id == user.id,
+        AuthActionToken.purpose == "verify_email",
+        AuthActionToken.used_at.is_(None),
+    ).values(used_at=now))
+    raw_code = f"{secrets.randbelow(1_000_000):06d}"
+    action_token = AuthActionToken(
+        user_id=user.id,
+        purpose="verify_email",
+        token_hash=token_hash(f"verify_email:{target_email.lower()}:{raw_code}"),
+        target_email=target_email,
+        expires_at=now + timedelta(minutes=settings.email_verification_code_minutes),
+    )
+    db.add(action_token)
+    db.commit()
+    try:
+        send_tracked_auth_mail(db, user, "verify_email", AuthMail(
+            recipient=target_email,
+            subject="你的行旅邮箱验证码",
+            body=f"你的邮箱验证码是：{raw_code}\n\n验证码将在 {settings.email_verification_code_minutes} 分钟后失效，请勿告诉他人。",
+            html_body=verification_email_html(raw_code, settings.email_verification_code_minutes),
+        ))
+    except MailDeliveryError as exc:
+        logger.warning("Auth email delivery failed: %s", type(exc).__name__)
+        action_token.used_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.commit()
+        raise HTTPException(status_code=503, detail="验证码暂时发送失败，请稍后重试") from exc
+    if settings.environment == "development" and settings.mail_delivery_mode == "console":
+        return raw_code
+    return None
+
+
 def issue_auth_action(db: Session, user: User, purpose: str, target_email: str, path: str, expires_minutes: int) -> str | None:
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     db.execute(update(AuthActionToken).where(
@@ -434,29 +581,40 @@ def issue_auth_action(db: Session, user: User, purpose: str, target_email: str, 
         AuthActionToken.used_at.is_(None),
     ).values(used_at=now))
     raw_token = secrets.token_urlsafe(48)
-    db.add(AuthActionToken(
+    action_token = AuthActionToken(
         user_id=user.id,
         purpose=purpose,
         token_hash=token_hash(raw_token),
         target_email=target_email,
         expires_at=now + timedelta(minutes=expires_minutes),
-    ))
+    )
+    db.add(action_token)
     db.commit()
     action_url = f"{settings.app_base_url.rstrip('/')}{path}?{urlencode({'token': raw_token})}"
     subject_map = {
-        "verify_email": "验证你的行旅邮箱",
         "reset_password": "重置你的行旅密码",
         "change_email": "确认新的行旅邮箱",
     }
     body_map = {
-        "verify_email": f"请打开下面的链接验证邮箱。链接将在 {expires_minutes} 分钟后失效。\n\n{action_url}",
         "reset_password": f"请打开下面的链接重置密码。链接将在 {expires_minutes} 分钟后失效。\n\n{action_url}",
         "change_email": f"请打开下面的链接确认新邮箱。链接将在 {expires_minutes} 分钟后失效。\n\n{action_url}",
     }
+    action_label_map = {
+        "reset_password": "重设密码",
+        "change_email": "确认新邮箱",
+    }
     try:
-        send_auth_mail(AuthMail(recipient=target_email, subject=subject_map[purpose], body=body_map[purpose]))
+        send_tracked_auth_mail(db, user, purpose, AuthMail(
+            recipient=target_email,
+            subject=subject_map[purpose],
+            body=body_map[purpose],
+            html_body=action_email_html(subject_map[purpose], action_label_map[purpose], action_url, expires_minutes),
+        ))
     except MailDeliveryError as exc:
         logger.warning("Auth email delivery failed: %s", type(exc).__name__)
+        action_token.used_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.commit()
+        raise HTTPException(status_code=503, detail="邮件暂时发送失败，请稍后重试") from exc
     if settings.environment == "development" and settings.mail_delivery_mode == "console":
         return action_url
     return None
@@ -615,14 +773,43 @@ def register(data: RegisterIn, request: Request, db: Session = Depends(get_db)):
     enforce_auth_rate_limit(db, request, "register", email)
     if re.fullmatch(r"\d{4}", username):
         raise HTTPException(status_code=422, detail="用户名不能是 4 位纯数字，以免与用户 ID 混淆")
-    existing = db.scalar(select(User).where((User.username == username) | (User.email == email)))
-    dev_action_url = None
-    if existing:
-        if existing.is_active and existing.email.lower() == email and existing.email_verified_at is None:
-            dev_action_url = issue_auth_action(
-                db, existing, "verify_email", existing.email, "/auth/verify-email", settings.auth_email_token_minutes,
+    existing_username = db.scalar(select(User).where(User.username == username))
+    existing_email = db.scalar(select(User).where(func.lower(User.email) == email))
+    if existing_username:
+        if existing_username.email.lower() != email:
+            can_correct = (
+                existing_username.is_active
+                and existing_username.email_verified_at is None
+                and existing_email is None
+                and verify_password(data.password, existing_username.password_hash)
             )
-        return {"message": "如果资料可用，验证邮件已发送，请检查邮箱。", "dev_action_url": dev_action_url}
+            if not can_correct:
+                raise HTTPException(status_code=409, detail="用户名已被使用，请更换用户名")
+            existing_username.email = email
+            db.execute(update(AuthActionToken).where(
+                AuthActionToken.user_id == existing_username.id,
+                AuthActionToken.purpose == "verify_email",
+                AuthActionToken.used_at.is_(None),
+            ).values(used_at=datetime.now(timezone.utc).replace(tzinfo=None)))
+            try:
+                db.commit()
+            except IntegrityError as exc:
+                db.rollback()
+                raise HTTPException(status_code=409, detail="邮箱已被使用，请更换邮箱") from exc
+            return {
+                "message": f"邮箱已更正为 {mask_email(email)}，请点击“发送验证码”。",
+                "masked_email": mask_email(email),
+                "retry_after_seconds": 0,
+            }
+        if existing_username.is_active and existing_username.email_verified_at is None:
+            return {
+                "message": "账号已创建但邮箱尚未验证，请点击“发送验证码”。",
+                "masked_email": mask_email(email),
+                "retry_after_seconds": 0,
+            }
+        raise HTTPException(status_code=409, detail="用户名已被使用，请更换用户名")
+    if existing_email:
+        return {"message": "如果资料可以注册，账号已创建，请继续邮箱验证。"}
     password_hash = hash_password(data.password)
     for _ in range(10):
         user = User(public_id=allocate_public_id(db), username=username, email=email, password_hash=password_hash, role="user", email_verified_at=None)
@@ -632,26 +819,37 @@ def register(data: RegisterIn, request: Request, db: Session = Depends(get_db)):
             break
         except IntegrityError:
             db.rollback()
-            if db.scalar(select(User).where((User.username == username) | (User.email == email))):
-                return {"message": "如果资料可用，验证邮件已发送，请检查邮箱。", "dev_action_url": None}
+            if db.scalar(select(User).where(User.username == username)):
+                raise HTTPException(status_code=409, detail="用户名已被使用，请更换用户名")
+            if db.scalar(select(User).where(func.lower(User.email) == email)):
+                return {"message": "如果资料可以注册，账号已创建，请继续邮箱验证。"}
     else:
         raise HTTPException(status_code=503, detail="用户 ID 分配冲突，请稍后重试")
-    db.refresh(user)
-    dev_action_url = issue_auth_action(
-        db, user, "verify_email", email, "/auth/verify-email", settings.auth_email_token_minutes,
-    )
-    return {"message": "如果资料可用，验证邮件已发送，请检查邮箱。", "dev_action_url": dev_action_url}
+    return {
+        "message": "账号已创建，请发送验证码完成邮箱验证。",
+        "masked_email": mask_email(email),
+        "retry_after_seconds": 0,
+    }
 
 
 @app.post("/api/v1/auth/verify-email", response_model=AuthActionOut)
-def verify_email(data: AuthTokenIn, request: Request, db: Session = Depends(get_db)):
+def verify_email(data: EmailVerificationIn, request: Request, db: Session = Depends(get_db)):
     ensure_public_origin(request)
-    enforce_auth_rate_limit(db, request, "verify_email", token_hash(data.token))
-    action_token = valid_auth_action(db, data.token, "verify_email")
-    user = db.get(User, action_token.user_id)
-    if not user or not user.is_active:
-        raise HTTPException(400, "链接无效、已过期或已经使用")
+    email = str(data.email).strip().lower()
+    enforce_auth_rate_limit(db, request, "verify_email", email)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+    action_token = db.scalar(select(AuthActionToken).where(
+        AuthActionToken.token_hash == token_hash(f"verify_email:{email}:{data.code}"),
+        AuthActionToken.purpose == "verify_email",
+        AuthActionToken.target_email == email,
+        AuthActionToken.used_at.is_(None),
+        AuthActionToken.expires_at > now,
+    ))
+    if action_token is None:
+        raise HTTPException(400, "验证码错误或已过期")
+    user = db.get(User, action_token.user_id)
+    if not user or not user.is_active or user.email.lower() != email:
+        raise HTTPException(400, "验证码错误或已过期")
     user.email_verified_at = now
     db.execute(update(AuthActionToken).where(
         AuthActionToken.user_id == user.id,
@@ -662,18 +860,29 @@ def verify_email(data: AuthTokenIn, request: Request, db: Session = Depends(get_
     return {"message": "邮箱验证成功，现在可以登录。"}
 
 
+@app.post("/api/v1/auth/send-verification-code", response_model=AuthActionOut, status_code=202)
 @app.post("/api/v1/auth/resend-verification", response_model=AuthActionOut, status_code=202)
 def resend_verification(data: EmailRequestIn, request: Request, db: Session = Depends(get_db)):
     ensure_public_origin(request)
     email = str(data.email).strip().lower()
     enforce_auth_rate_limit(db, request, "resend_verification", email)
     user = db.scalar(select(User).where(func.lower(User.email) == email, User.is_active.is_(True)))
-    dev_action_url = None
     if user and user.email_verified_at is None:
-        dev_action_url = issue_auth_action(
-            db, user, "verify_email", user.email, "/auth/verify-email", settings.auth_email_token_minutes,
-        )
-    return {"message": "如果邮箱需要验证，验证邮件会发送到该邮箱。", "dev_action_url": dev_action_url}
+        retry_after = verification_retry_after(db, user.id)
+        if retry_after:
+            return {
+                "message": f"如果该邮箱需要验证，验证码已发送至 {mask_email(email)}，请检查收件箱；{retry_after} 秒后可以重新发送。",
+                "masked_email": mask_email(email),
+                "expires_in_seconds": settings.email_verification_code_minutes * 60,
+                "retry_after_seconds": retry_after,
+            }
+        return verification_response(email, issue_email_verification_code(db, user, email))
+    return {
+        "message": f"如果该邮箱需要验证，验证码已发送至 {mask_email(email)}，请检查收件箱；60 秒后可以重新发送。",
+        "masked_email": mask_email(email),
+        "expires_in_seconds": settings.email_verification_code_minutes * 60,
+        "retry_after_seconds": VERIFICATION_RESEND_COOLDOWN_SECONDS,
+    }
 
 
 @app.post("/api/v1/auth/forgot-password", response_model=AuthActionOut, status_code=202)
@@ -997,6 +1206,29 @@ def city_attractions(city_id: int, db: Session = Depends(get_db)):
     return sorted(attractions, key=lambda item: (-attraction_hot_score(db, item), item.id))
 
 
+@app.get("/api/v1/attractions/search", response_model=list[AttractionOut])
+def search_attractions(q: str = Query(default="", min_length=0, max_length=80), db: Session = Depends(get_db)):
+    keyword = q.strip()
+    if not keyword:
+        return []
+    return list(db.scalars(
+        select(Attraction)
+        .join(City, Attraction.city_id == City.id)
+        .where(
+            Attraction.is_active.is_(True),
+            City.is_active.is_(True),
+            or_(
+                Attraction.name.contains(keyword),
+                Attraction.description.contains(keyword),
+                Attraction.area.contains(keyword),
+                City.name.contains(keyword),
+            ),
+        )
+        .order_by(Attraction.id)
+        .limit(10)
+    ))
+
+
 @app.get("/api/v1/attractions/{attraction_id}", response_model=AttractionOut)
 def get_attraction(attraction_id: int, db: Session = Depends(get_db)):
     attraction = db.get(Attraction, attraction_id)
@@ -1058,10 +1290,11 @@ def autofill_media_asset(asset_id: int, request: Request, user: User = Depends(c
     attraction = db.get(Attraction, asset.attraction_id) if asset.attraction_id else None
     if not city:
         raise HTTPException(409, "图片所属城市不存在")
-    query = f"{attraction.name if attraction else city.name} {city.name} China"
-    candidate = search_commons_image(query)
+    search_term = attraction.name if attraction else city.name
+    candidates = collect_photo_candidates(search_term, limit=1, city=city.name)
+    candidate = candidates[0] if candidates else None
     if not candidate:
-        raise HTTPException(404, "未找到可用候选图片，请手动填写图片来源")
+        raise HTTPException(404, "未找到可用候选图片，请手动填写图片地址或上传本地图片")
     asset.storage_type = "remote_url"
     asset.url = candidate["url"]
     asset.storage_path = None
@@ -1078,6 +1311,26 @@ def autofill_media_asset(asset_id: int, request: Request, user: User = Depends(c
     db.commit()
     db.refresh(asset)
     return asset
+
+
+@app.patch("/api/v1/admin/media-assets/actions/bulk")
+def bulk_update_media_assets(data: MediaAssetBulkUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    assets = list(db.scalars(select(MediaAsset).where(MediaAsset.id.in_(set(data.asset_ids)))))
+    if len(assets) != len(set(data.asset_ids)):
+        raise HTTPException(404, "部分图片记录不存在")
+    if data.is_active and data.verification_status not in (None, "approved") and any(asset.verification_status != "approved" for asset in assets):
+        raise HTTPException(422, "只能启用已核验图片")
+    for asset in assets:
+        if data.verification_status is not None:
+            asset.verification_status = data.verification_status
+        if data.is_active is not None:
+            asset.is_active = data.is_active
+        sync_media_display_target(db, asset)
+    record_admin_audit(db, user, "bulk_update", "media_asset", None, f"批量更新 {len(assets)} 张图片", {"fields": sorted(data.model_fields_set)})
+    db.commit()
+    return {"updated": len(assets)}
 
 
 @app.patch("/api/v1/admin/media-assets/{asset_id}", response_model=MediaAssetOut)
@@ -1103,6 +1356,239 @@ def update_media_asset(asset_id: int, data: MediaAssetUpdateIn, request: Request
     db.commit()
     db.refresh(asset)
     return asset
+
+
+@app.post("/api/v1/admin/media-assets/{asset_id}/upload", response_model=MediaAssetOut)
+async def upload_media_asset_file(
+    asset_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    require_admin(user)
+    ensure_csrf(request)
+    asset = db.get(MediaAsset, asset_id)
+    if not asset:
+        raise HTTPException(404, "图片记录不存在")
+    if asset.is_active:
+        raise HTTPException(409, "已启用的图片请先停用再上传替换，避免中断前台展示")
+    city = db.get(City, asset.city_id)
+    if not city:
+        raise HTTPException(409, "图片所属城市不存在")
+    attraction = db.get(Attraction, asset.attraction_id) if asset.attraction_id else None
+    content = await file.read(8 * 1024 * 1024 + 1)
+    try:
+        cleaned, mime_type, suffix = sanitize_image_bytes(content)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    relative_dir = f"attractions/{city.slug}/{attraction.id}/cover" if attraction else f"cities/{city.slug}/cover"
+    file_name = f"{uuid.uuid4().hex}{suffix}"
+    target = (MEDIA_ROOT / relative_dir / file_name).resolve()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(cleaned)
+    except OSError as exc:
+        raise HTTPException(500, "图片保存失败，请检查磁盘空间或目录权限") from exc
+    if asset.storage_type == "local_file" and asset.storage_path:
+        old = (MEDIA_ROOT / asset.storage_path).resolve()
+        if old.is_file() and MEDIA_ROOT.resolve() in old.parents and old != target:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    asset.storage_type = "local_file"
+    asset.storage_path = f"{relative_dir}/{file_name}"
+    asset.url = media_display_url(asset)
+    asset.mime_type = mime_type
+    asset.source_name = "本地导入"
+    asset.source_author = None
+    asset.license_name = None
+    asset.attribution_url = None
+    asset.verification_status = "needs_review"
+    asset.is_active = False
+    sync_media_display_target(db, asset)
+    record_admin_audit(db, user, "upload", "media_asset", asset.id, f"上传本地图片：{asset.content_key}")
+    db.commit()
+    db.refresh(asset)
+    return asset
+
+
+def available_photo_providers() -> list[str]:
+    """List the photo providers that the current configuration can actually use."""
+    providers = ["Wikimedia Commons"]
+    if settings.amap_web_service_key:
+        providers.append("高德地图")
+    if settings.unsplash_access_key:
+        providers.append("Unsplash")
+    if settings.pexels_api_key:
+        providers.append("Pexels")
+    return providers
+
+
+@app.get("/api/v1/admin/photos", response_model=list[MediaAssetOut])
+def admin_list_photos(
+    city_id: int | None = Query(default=None, ge=1),
+    attraction_id: int | None = Query(default=None, ge=1),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    require_admin(user)
+    query = select(MediaAsset).where(MediaAsset.purpose.like("photo-%"))
+    if city_id is not None:
+        query = query.where(MediaAsset.city_id == city_id)
+    if attraction_id is not None:
+        query = query.where(MediaAsset.attraction_id == attraction_id)
+    return list(db.scalars(query.order_by(MediaAsset.id.desc())))
+
+
+@app.get("/api/v1/admin/photos/providers")
+def admin_photo_providers(user: User = Depends(current_user)):
+    require_admin(user)
+    return {"providers": available_photo_providers(), "download_enabled": settings.photo_download_enabled}
+
+
+@app.post("/api/v1/admin/photos/fetch", response_model=AdminPhotoFetchOut)
+def fetch_admin_photos(data: AdminPhotoFetchIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    city = db.get(City, data.city_id)
+    if not city:
+        raise HTTPException(404, "城市不存在")
+    attraction = None
+    if data.attraction_id is not None:
+        attraction = db.get(Attraction, data.attraction_id)
+        if not attraction or attraction.city_id != data.city_id:
+            raise HTTPException(409, "景点不存在或不属于该城市")
+
+    candidates = collect_photo_candidates(data.keyword, limit=data.limit, city=city.name)
+    if not candidates:
+        raise HTTPException(404, "未找到可用图片，请换个关键词或稍后再试")
+
+    scope = [MediaAsset.city_id == data.city_id, MediaAsset.purpose.like("photo-%")]
+    scope.append(MediaAsset.attraction_id.is_(None) if data.attraction_id is None else MediaAsset.attraction_id == data.attraction_id)
+    existing_urls = set(db.scalars(select(MediaAsset.url).where(*scope)))
+    used_purposes = set(db.scalars(select(MediaAsset.purpose).where(*scope)))
+
+    relative_dir = f"attractions/{city.slug}/{attraction.id}/photos" if attraction else f"cities/{city.slug}/photos"
+    file_prefix = attraction.name if attraction else city.name
+    saved: list[MediaAsset] = []
+    skipped = 0
+    sequence = len(used_purposes)
+
+    for candidate in candidates:
+        if candidate["url"] in existing_urls:
+            skipped += 1
+            continue
+        sequence += 1
+        purpose = f"photo-{sequence}"
+        while purpose in used_purposes:
+            sequence += 1
+            purpose = f"photo-{sequence}"
+        used_purposes.add(purpose)
+        existing_urls.add(candidate["url"])
+        asset = MediaAsset(
+            city_id=data.city_id,
+            attraction_id=data.attraction_id,
+            purpose=purpose,
+            content_key=f"photo-{city.slug}-{attraction.id if attraction else 0}-{sequence}",
+            storage_type="remote_url",
+            url=candidate["url"],
+            mime_type=candidate.get("mime_type"),
+            alt_text=(candidate.get("alt_text") or data.keyword)[:240],
+            source_name=candidate.get("source_name"),
+            source_author=candidate.get("source_author"),
+            license_name=candidate.get("license_name"),
+            attribution_url=candidate.get("attribution_url"),
+            verification_status="approved" if data.auto_approve else "needs_review",
+            is_active=data.auto_approve,
+        )
+        if settings.photo_download_enabled:
+            storage_path = download_image(candidate["url"], MEDIA_ROOT, relative_dir, f"{file_prefix}-{sequence}", candidate.get("mime_type"))
+            if storage_path:
+                asset.storage_type = "local_file"
+                asset.storage_path = storage_path
+                asset.url = media_display_url(asset)
+        db.add(asset)
+        saved.append(asset)
+
+    if not saved:
+        raise HTTPException(409, "这些图片已经抓取过了，请换个关键词")
+    record_admin_audit(db, user, "fetch", "media_asset", None, f"自动抓取相片：{data.keyword}，新增 {len(saved)} 张")
+    db.commit()
+    for asset in saved:
+        db.refresh(asset)
+    return {"keyword": data.keyword, "fetched": len(saved), "skipped": skipped, "providers": available_photo_providers(), "items": saved}
+
+
+@app.delete("/api/v1/admin/photos/{asset_id}", status_code=204)
+def admin_delete_photo(asset_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    asset = db.get(MediaAsset, asset_id)
+    if not asset or not asset.purpose.startswith("photo-"):
+        raise HTTPException(404, "相片不存在")
+    if asset.storage_type == "local_file" and asset.storage_path:
+        target = (MEDIA_ROOT / asset.storage_path).resolve()
+        if target.is_file() and MEDIA_ROOT.resolve() in target.parents:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+    record_admin_audit(db, user, "delete", "media_asset", asset.id, f"删除相片：{asset.content_key}")
+    db.delete(asset)
+    db.commit()
+
+
+@app.post("/api/v1/admin/photos/{photo_id}/use-as-cover", response_model=MediaAssetOut)
+def use_photo_as_cover(photo_id: int, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    photo = db.get(MediaAsset, photo_id)
+    if not photo or not photo.purpose.startswith("photo-"):
+        raise HTTPException(404, "相片不存在")
+    city = db.get(City, photo.city_id)
+    if not city:
+        raise HTTPException(409, "相片所属城市不存在")
+    attraction = db.get(Attraction, photo.attraction_id) if photo.attraction_id else None
+    purpose = "attraction_cover" if attraction else "city_cover"
+    cover = db.scalar(select(MediaAsset).where(
+        MediaAsset.city_id == photo.city_id,
+        MediaAsset.attraction_id == photo.attraction_id,
+        MediaAsset.purpose == purpose,
+    ))
+    if cover is None:
+        cover = MediaAsset(
+            city_id=photo.city_id,
+            attraction_id=photo.attraction_id,
+            purpose=purpose,
+            content_key=f"{city.slug}:attraction:{attraction.id}:cover" if attraction else f"{city.slug}:city:cover",
+            storage_type=photo.storage_type,
+            url=photo.url,
+            storage_path=photo.storage_path,
+            mime_type=photo.mime_type,
+            alt_text=photo.alt_text,
+            source_name=photo.source_name,
+            source_author=photo.source_author,
+            license_name=photo.license_name,
+            attribution_url=photo.attribution_url,
+            verification_status="needs_review",
+            is_active=False,
+        )
+        db.add(cover)
+    else:
+        if cover.is_active:
+            raise HTTPException(409, "该封面正在展示，请先在图片管理中停用，再设为封面")
+        for field in ("storage_type", "url", "storage_path", "mime_type", "alt_text", "source_name", "source_author", "license_name", "attribution_url"):
+            setattr(cover, field, getattr(photo, field))
+        cover.verification_status = "needs_review"
+        cover.is_active = False
+    sync_media_display_target(db, cover)
+    target_label = attraction.name if attraction else city.name
+    record_admin_audit(db, user, "set_cover", "media_asset", cover.id, f"相片设为封面：{target_label} · {purpose}")
+    db.commit()
+    db.refresh(cover)
+    return cover
 
 
 def admin_city_dict(db: Session, city: City) -> dict:
@@ -1742,6 +2228,12 @@ async def plan_confirm(
     if active_job:
         raise HTTPException(status_code=409, detail="当前会话已有任务正在处理")
     allowed_patch = data.patch.model_dump(exclude_none=True)
+    origin_city_id = allowed_patch.get("origin_city_id")
+    if origin_city_id:
+        origin_city = db.get(City, origin_city_id)
+        if not origin_city or not origin_city.is_active:
+            raise HTTPException(status_code=422, detail="所选出发城市不可用")
+        allowed_patch["origin"] = origin_city.name
     destination_city_id = allowed_patch.get("destination_city_id")
     if destination_city_id:
         city = db.get(City, destination_city_id)
@@ -2041,12 +2533,12 @@ async def upload_community_images(
     community_root.mkdir(parents=True, exist_ok=True)
     for index, upload in enumerate(files):
         content = await upload.read(8 * 1024 * 1024 + 1)
-        detected = image_type_from_bytes(content)
-        if len(content) > 8 * 1024 * 1024 or not detected:
-            raise HTTPException(422, "照片仅支持 JPEG、PNG 或 WebP，且单张不能超过 8MB")
-        mime_type, suffix = detected
+        try:
+            cleaned, mime_type, suffix = sanitize_image_bytes(content)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         storage_path = f"community/{uuid.uuid4().hex}{suffix}"
-        (MEDIA_ROOT / storage_path).write_bytes(content)
+        (MEDIA_ROOT / storage_path).write_bytes(cleaned)
         saved_images.append(CommunityPostImage(
             post_id=post_id,
             storage_path=storage_path,
@@ -2483,7 +2975,15 @@ def itinerary_feedback(itinerary_id: int, user: User = Depends(current_user), db
     itinerary_for_user(itinerary_id, user, db)
     mine = db.scalar(select(ItineraryFeedback).where(ItineraryFeedback.itinerary_id == itinerary_id, ItineraryFeedback.user_id == user.id))
     values = list(db.scalars(select(ItineraryFeedback.rating).where(ItineraryFeedback.itinerary_id == itinerary_id)))
-    return {"rating": mine.rating if mine else None, "comment": mine.comment if mine else "", "average": round(sum(values) / len(values), 1) if values else None, "count": len(values)}
+    return {
+        "rating": mine.rating if mine else None,
+        "comment": mine.comment if mine else "",
+        "average": round(sum(values) / len(values), 1) if values else None,
+        "count": len(values),
+        "status": mine.status if mine else None,
+        "admin_reply": mine.admin_reply if mine else None,
+        "replied_at": mine.replied_at if mine else None,
+    }
 
 
 @app.put("/api/v1/itineraries/{itinerary_id}/feedback", response_model=FeedbackOut)
@@ -2497,6 +2997,10 @@ def save_itinerary_feedback(itinerary_id: int, data: FeedbackIn, request: Reques
     else:
         feedback.rating = data.rating
         feedback.comment = data.comment.strip()
+        feedback.status = "open"
+        feedback.admin_reply = None
+        feedback.replied_at = None
+        feedback.handled_at = None
     db.commit()
     db.refresh(feedback)
     return feedback
@@ -2636,9 +3140,53 @@ def admin_overview(user: User = Depends(current_user), db: Session = Depends(get
         "itineraries": db.scalar(select(func.count(Itinerary.id))),
         "deleted_itineraries": db.scalar(select(func.count(Itinerary.id)).where(Itinerary.deleted_at.is_not(None))),
         "feedback": db.scalar(select(func.count(ItineraryFeedback.id))),
+        "email_outbox": db.scalar(select(func.count(EmailOutbox.id))),
+        "failed_email_outbox": db.scalar(select(func.count(EmailOutbox.id)).where(EmailOutbox.status == "failed")),
         "media_assets": db.scalar(select(func.count(MediaAsset.id))),
+        "photos": db.scalar(select(func.count(MediaAsset.id)).where(MediaAsset.purpose.like("photo-%"))),
         "community_posts": db.scalar(select(func.count(CommunityPost.id))),
         "community_reports": db.scalar(select(func.count(ContentReport.id)).where(ContentReport.status == "open")),
+        "knowledge_documents": db.scalar(select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.status == "approved")),
+    }
+
+
+def admin_email_outbox_dict(delivery: EmailOutbox, account: User | None) -> dict:
+    return {
+        "id": delivery.id,
+        "user_id": delivery.user_id,
+        "username": account.username if account else None,
+        "purpose": delivery.purpose,
+        "recipient_masked": delivery.recipient_masked,
+        "subject": delivery.subject,
+        "status": delivery.status,
+        "attempt_count": delivery.attempt_count,
+        "retry_count": delivery.retry_count,
+        "last_error_code": delivery.last_error_code,
+        "sent_at": delivery.sent_at,
+        "created_at": delivery.created_at,
+        "updated_at": delivery.updated_at,
+    }
+
+
+@app.get("/api/v1/admin/email-outbox", response_model=AdminEmailOutboxPageOut)
+def admin_email_outbox(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=10, le=100),
+    status_filter: str = Query(default="all", alias="status", pattern="^(all|sent|failed|simulated)$"),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    require_admin(user)
+    filters = [EmailOutbox.status == status_filter] if status_filter != "all" else []
+    total = db.scalar(select(func.count(EmailOutbox.id)).where(*filters)) or 0
+    deliveries = db.scalars(
+        select(EmailOutbox).where(*filters).order_by(EmailOutbox.created_at.desc(), EmailOutbox.id.desc()).offset((page - 1) * page_size).limit(page_size)
+    )
+    return {
+        "items": [admin_email_outbox_dict(delivery, db.get(User, delivery.user_id) if delivery.user_id else None) for delivery in deliveries],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
     }
 
 
@@ -2685,34 +3233,150 @@ def admin_users(
     return {"items": results, "total": total, "page": page, "page_size": page_size}
 
 
+def admin_feedback_dict(feedback: ItineraryFeedback, itinerary: Itinerary, owner: User, assignee: User | None) -> dict:
+    return {
+        "id": feedback.id,
+        "itinerary_id": itinerary.id,
+        "username": owner.username,
+        "email": owner.email,
+        "city_name": itinerary.city_name,
+        "itinerary_title": itinerary.title,
+        "rating": feedback.rating,
+        "comment": feedback.comment or "",
+        "status": feedback.status,
+        "assigned_admin_id": feedback.assigned_admin_id,
+        "assigned_admin_username": assignee.username if assignee else None,
+        "admin_reply": feedback.admin_reply,
+        "replied_at": feedback.replied_at,
+        "handled_at": feedback.handled_at,
+        "created_at": feedback.created_at,
+        "updated_at": feedback.updated_at,
+    }
+
+
 @app.get("/api/v1/admin/feedback", response_model=AdminFeedbackPageOut)
 def admin_feedback(
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=10, ge=10, le=10),
+    page_size: int = Query(default=10, ge=1, le=100),
+    status_filter: str = Query(default="all", alias="status", pattern="^(all|open|in_progress|resolved)$"),
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ):
     require_admin(user)
-    feedback_query = select(ItineraryFeedback).join(Itinerary, Itinerary.id == ItineraryFeedback.itinerary_id).join(User, User.id == ItineraryFeedback.user_id)
-    total = db.scalar(select(func.count(ItineraryFeedback.id)).join(Itinerary, Itinerary.id == ItineraryFeedback.itinerary_id).join(User, User.id == ItineraryFeedback.user_id)) or 0
+    filters = [ItineraryFeedback.status == status_filter] if status_filter != "all" else []
+    feedback_query = select(ItineraryFeedback).join(Itinerary, Itinerary.id == ItineraryFeedback.itinerary_id).join(User, User.id == ItineraryFeedback.user_id).where(*filters)
+    total = db.scalar(select(func.count(ItineraryFeedback.id)).join(Itinerary, Itinerary.id == ItineraryFeedback.itinerary_id).join(User, User.id == ItineraryFeedback.user_id).where(*filters)) or 0
     results = []
     for feedback in db.scalars(feedback_query.order_by(ItineraryFeedback.created_at.desc(), ItineraryFeedback.id.desc()).offset((page - 1) * page_size).limit(page_size)):
         itinerary = db.get(Itinerary, feedback.itinerary_id)
         owner = db.get(User, feedback.user_id)
         if itinerary and owner:
-            results.append({
-                "id": feedback.id,
-                "itinerary_id": itinerary.id,
-                "username": owner.username,
-                "email": owner.email,
-                "city_name": itinerary.city_name,
-                "itinerary_title": itinerary.title,
-                "rating": feedback.rating,
-                "comment": feedback.comment or "",
-                "created_at": feedback.created_at,
-                "updated_at": feedback.updated_at,
-            })
+            results.append(admin_feedback_dict(feedback, itinerary, owner, db.get(User, feedback.assigned_admin_id) if feedback.assigned_admin_id else None))
     return {"items": results, "total": total, "page": page, "page_size": page_size}
+
+
+@app.get("/api/v1/admin/feedback/assignees")
+def admin_feedback_assignees(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    return [{"id": account.id, "username": account.username} for account in db.scalars(select(User).where(User.role == "admin", User.is_active.is_(True)).order_by(User.username))]
+
+
+@app.patch("/api/v1/admin/feedback/{feedback_id}", response_model=AdminFeedbackOut)
+def update_admin_feedback(feedback_id: int, data: AdminFeedbackUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    feedback = db.get(ItineraryFeedback, feedback_id)
+    if not feedback:
+        raise HTTPException(404, "反馈不存在")
+    before_status = feedback.status
+    before_assignee = feedback.assigned_admin_id
+    reply_changed = "admin_reply" in data.model_fields_set and data.admin_reply != feedback.admin_reply
+    if "assigned_admin_id" in data.model_fields_set:
+        if data.assigned_admin_id is None:
+            feedback.assigned_admin_id = None
+        else:
+            assignee = db.get(User, data.assigned_admin_id)
+            if not assignee or assignee.role != "admin" or not assignee.is_active:
+                raise HTTPException(422, "只能分派给启用的管理员")
+            feedback.assigned_admin_id = assignee.id
+    if data.status is not None:
+        feedback.status = data.status
+    if feedback.status != "open" and feedback.assigned_admin_id is None:
+        feedback.assigned_admin_id = user.id
+    if "admin_reply" in data.model_fields_set:
+        feedback.admin_reply = data.admin_reply.strip() if data.admin_reply else None
+        feedback.replied_at = datetime.now(timezone.utc).replace(tzinfo=None) if feedback.admin_reply else None
+    feedback.handled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    record_admin_audit(db, user, "update", "feedback", feedback.id, "更新反馈处理信息", {
+        "from_status": before_status,
+        "to_status": feedback.status,
+        "assignment_changed": before_assignee != feedback.assigned_admin_id,
+        "reply_changed": reply_changed,
+    })
+    db.commit()
+    db.refresh(feedback)
+    itinerary = db.get(Itinerary, feedback.itinerary_id)
+    owner = db.get(User, feedback.user_id)
+    return admin_feedback_dict(feedback, itinerary, owner, db.get(User, feedback.assigned_admin_id) if feedback.assigned_admin_id else None)
+
+
+def admin_knowledge_dict(db: Session, document: KnowledgeDocument) -> dict:
+    city = db.get(City, document.city_id)
+    return {
+        "id": document.id, "city_id": document.city_id, "city_name": city.name if city else "未知城市",
+        "title": document.title, "source_name": document.source_name, "source_url": document.source_url,
+        "license_note": document.license_note, "content": document.content, "status": document.status,
+        "chunk_count": db.scalar(select(func.count(KnowledgeChunk.id)).where(KnowledgeChunk.document_id == document.id)) or 0,
+        "updated_at": document.updated_at,
+    }
+
+
+@app.get("/api/v1/admin/knowledge-documents", response_model=list[AdminKnowledgeDocumentOut])
+def admin_knowledge_documents(status: str = Query(default="all", pattern="^(all|needs_review|approved|rejected|archived)$"), user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    filters = [KnowledgeDocument.status == status] if status != "all" else []
+    return [admin_knowledge_dict(db, document) for document in db.scalars(select(KnowledgeDocument).where(*filters).order_by(KnowledgeDocument.updated_at.desc()))]
+
+
+@app.post("/api/v1/admin/knowledge-documents", response_model=AdminKnowledgeDocumentOut, status_code=201)
+def create_knowledge_document(data: KnowledgeDocumentIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    if not db.get(City, data.city_id):
+        raise HTTPException(422, "所属城市不存在")
+    document = KnowledgeDocument(**data.model_dump(), status="needs_review")
+    db.add(document)
+    db.flush()
+    rebuild_knowledge_chunks(db, document)
+    record_admin_audit(db, user, "create", "knowledge_document", document.id, "录入待审核攻略资料", {"city_id": document.city_id, "chunk_count": len(document.content)})
+    db.commit()
+    return admin_knowledge_dict(db, document)
+
+
+@app.patch("/api/v1/admin/knowledge-documents/{document_id}", response_model=AdminKnowledgeDocumentOut)
+def update_knowledge_document(document_id: int, data: KnowledgeDocumentUpdateIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    require_admin(user)
+    ensure_csrf(request)
+    document = db.get(KnowledgeDocument, document_id)
+    if not document:
+        raise HTTPException(404, "攻略资料不存在")
+    if not db.get(City, data.city_id):
+        raise HTTPException(422, "所属城市不存在")
+    changed_content = document.content != data.content
+    for field, value in data.model_dump().items():
+        setattr(document, field, value)
+    if changed_content:
+        rebuild_knowledge_chunks(db, document)
+    record_admin_audit(db, user, "update", "knowledge_document", document.id, "更新攻略资料或审核状态", {"status": document.status, "content_changed": changed_content})
+    db.commit()
+    return admin_knowledge_dict(db, document)
+
+
+@app.get("/api/v1/guide-knowledge/search")
+def guide_knowledge_search(city_id: int = Query(ge=1), query: str = Query(min_length=1, max_length=500), user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if not db.get(City, city_id):
+        raise HTTPException(404, "城市不存在")
+    return {"items": [{key: value for key, value in hit.items() if key != "score"} for hit in search_guide_knowledge(db, city_id, query, top_k=3)]}
 
 
 @app.get("/api/v1/admin/community/posts")

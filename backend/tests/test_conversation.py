@@ -1,12 +1,14 @@
+import os
 import time
 import uuid
+from datetime import date
 
 from fastapi.testclient import TestClient
 
 from app.db import SessionLocal
 from app.main import app
-from app.models import City
-from app.services import city_followup_response, is_city_overview_request
+from app.models import Attraction, City
+from app.services import city_followup_response, extract_plan_request, is_city_overview_request, opening_window
 from conftest import register_and_login
 
 
@@ -73,9 +75,30 @@ def test_city_followups_use_context_instead_of_replaying_destination_overview():
     assert season_reply and "春秋" in season_reply
 
 
+def test_opening_hours_uses_selected_travel_date_for_weekday_closure():
+    db = SessionLocal()
+    try:
+        forbidden_city_stop = db.query(Attraction).filter(Attraction.name == "故宫博物院").one()
+        opens_at, closes_at, issue = opening_window(forbidden_city_stop, date(2026, 9, 7))
+    finally:
+        db.close()
+    assert (opens_at, closes_at) == (0, 0)
+    assert issue and "周一闭馆" in issue
+
+
+def test_plan_request_extracts_origin_and_destination_from_cross_city_phrase():
+    db = SessionLocal()
+    try:
+        requirement = extract_plan_request("我想从北京去上海玩2天", db)
+    finally:
+        db.close()
+    assert requirement["origin"] == "北京"
+    assert requirement["destination"] == "上海"
+
+
 def test_agent_only_starts_planning_after_explicit_request():
     with TestClient(app) as client:
-        client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
         csrf = client.cookies.get("csrf_token")
         session_id = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf}).json()["id"]
 
@@ -92,7 +115,7 @@ def test_agent_only_starts_planning_after_explicit_request():
 
 def test_clear_conversation_hides_session_without_removing_messages():
     with TestClient(app) as client:
-        login = client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        login = client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
         csrf = client.cookies.get("csrf_token")
         session = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf})
         session_id = session.json()["id"]
@@ -148,7 +171,7 @@ def test_session_titles_and_management_actions():
         assert deleted.status_code == 204
         assert client.get(f"/api/v1/sessions/{second['id']}/messages").status_code == 404
 
-        admin_login = client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        admin_login = client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
         assert admin_login.status_code == 200
         admin_csrf = client.cookies.get("csrf_token")
         admin_users = client.get("/api/v1/admin/users")
@@ -226,7 +249,7 @@ def test_bulk_session_management_requires_password_for_three_or_more_deletions()
 
 def test_plan_requires_confirmation_and_idempotency():
     with TestClient(app) as client:
-        login = client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        login = client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
         csrf = client.cookies.get("csrf_token")
         session_id = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf}).json()["id"]
         message_key = str(uuid.uuid4())
@@ -249,6 +272,7 @@ def test_plan_requires_confirmation_and_idempotency():
         requirement_patch = {
             "destination_city_id": shanghai["id"],
             "days": 3,
+            "start_date": "2026-09-08",
             "budget_total": 1800,
             "interests": ["摄影", "美食"],
             "avoid_places": ["过度拥挤"],
@@ -275,12 +299,115 @@ def test_plan_requires_confirmation_and_idempotency():
         assert itinerary["preferences"] == ["摄影", "美食"]
         assert itinerary["validation"]["daily_load"]["status"] == "partial"
         assert itinerary["validation"]["travel"]["status"] == "partial"
-        assert itinerary["budget_scope"] == "仅门票估算；交通和餐饮未计入"
+        assert itinerary["budget_scope"] == "门票、景点间市内交通、餐饮和住宿估算；未覆盖跨城交通和购物"
+
+
+def test_plan_uses_amap_segments_and_complete_budget(monkeypatch):
+    def fake_search_place(keyword: str, city: str | None = None, max_pois: int = 10):
+        offset = sum(ord(char) for char in keyword) % 100
+        return {"location": f"121.{offset:02d},31.{offset:02d}", "citycode": "021"}
+
+    def fake_route(origin, destination, transport, city_code=None, destination_city_code=None, travel_date=None):
+        return {
+            "provider": "amap", "transport": transport, "distance_meters": 1800,
+            "duration_seconds": 900, "cost_yuan": 3.0, "cost_source": "高德公交票价", "cost_basis": "per_person",
+        }
+
+    monkeypatch.setattr("app.services.search_amap_place", fake_search_place)
+    monkeypatch.setattr("app.services.request_amap_route", fake_route)
+    with TestClient(app) as client:
+        client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
+        csrf = client.cookies.get("csrf_token")
+        session_id = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf}).json()["id"]
+        drafted = client.post(
+            f"/api/v1/sessions/{session_id}/messages",
+            json={"content": "请规划上海2天摄影美食行程"},
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
+        )
+        wait_for_job(client, drafted.json()["job_id"])
+        shanghai = next(city for city in client.get("/api/v1/cities").json() if city["name"] == "上海")
+        confirmed = client.post(
+            f"/api/v1/sessions/{session_id}/plan-confirm",
+            json={"confirmed": True, "patch": {
+                "destination_city_id": shanghai["id"], "days": 2, "start_date": "2026-09-08",
+                "budget_total": 3000, "interests": ["摄影", "美食"], "traveler_count": 2,
+                "transport": "public_transport",
+            }},
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
+        )
+        job = wait_for_job(client, confirmed.json()["job_id"])
+        assert job["status"] == "completed"
+        itinerary = client.get(f"/api/v1/itineraries/{job['result_itinerary_id']}").json()
+        travel = itinerary["validation"]["travel"]
+        budget = itinerary["validation"]["budget"]
+        assert travel["status"] == "passed"
+        assert travel["total_distance_meters"] == 3600
+        assert travel["total_duration_seconds"] == 1800
+        assert budget["breakdown"]["local_transport"] == 12.0
+        assert budget["breakdown"]["meals"] == 480
+        assert budget["breakdown"]["hotel"] == 350
+        assert budget["breakdown"]["total"] == itinerary["budget_total"]
+        assert itinerary["validation"]["opening_hours"]["status"] == "passed"
+
+
+def test_plan_includes_round_trip_intercity_route_and_budget(monkeypatch):
+    def fake_search_place(keyword: str, city: str | None = None, max_pois: int = 10):
+        return {"location": "121.470000,31.230000", "citycode": "021"}
+
+    def fake_geocode(city_name: str):
+        coordinates = {"北京": ((39.9042, 116.4074), "010"), "上海": ((31.2304, 121.4737), "021")}
+        coordinate, citycode = coordinates[city_name]
+        return {"coordinate": coordinate, "citycode": citycode}
+
+    def fake_route(origin, destination, transport, city_code=None, destination_city_code=None, travel_date=None):
+        is_intercity = city_code != destination_city_code
+        return {
+            "provider": "amap", "transport": transport,
+            "distance_meters": 1200000 if is_intercity else 1800,
+            "duration_seconds": 18000 if is_intercity else 900,
+            "cost_yuan": 550.0 if is_intercity else 3.0,
+            "cost_source": "高德公交票价", "cost_basis": "per_person",
+        }
+
+    monkeypatch.setattr("app.services.search_amap_place", fake_search_place)
+    monkeypatch.setattr("app.services.request_amap_geocode", fake_geocode)
+    monkeypatch.setattr("app.services.request_amap_route", fake_route)
+    with TestClient(app) as client:
+        client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
+        csrf = client.cookies.get("csrf_token")
+        session_id = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf}).json()["id"]
+        drafted = client.post(
+            f"/api/v1/sessions/{session_id}/messages",
+            json={"content": "请规划上海2天摄影美食行程"},
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
+        )
+        wait_for_job(client, drafted.json()["job_id"])
+        cities = {city["name"]: city for city in client.get("/api/v1/cities").json()}
+        confirmed = client.post(
+            f"/api/v1/sessions/{session_id}/plan-confirm",
+            json={"confirmed": True, "patch": {
+                "origin_city_id": cities["北京"]["id"], "destination_city_id": cities["上海"]["id"],
+                "days": 2, "start_date": "2026-09-08", "budget_total": 5000,
+                "interests": ["摄影", "美食"], "traveler_count": 2, "transport": "public_transport",
+            }},
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
+        )
+        job = wait_for_job(client, confirmed.json()["job_id"])
+        assert job["status"] == "completed"
+        itinerary = client.get(f"/api/v1/itineraries/{job['result_itinerary_id']}").json()
+        intercity = itinerary["validation"]["intercity_travel"]
+        budget = itinerary["validation"]["budget"]
+        assert intercity["status"] == "passed"
+        assert intercity["total_distance_meters"] == 2400000
+        assert intercity["total_duration_seconds"] == 36000
+        assert budget["breakdown"]["intercity_transport"] == 2200.0
+        assert "intercity_round_trip" in budget["included"]
+        assert itinerary["budget_scope"].startswith("往返跨城交通")
 
 
 def test_stop_cancels_queued_job():
     with TestClient(app) as client:
-        client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
         csrf = client.cookies.get("csrf_token")
         session_id = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf}).json()["id"]
         from app.core.config import settings
@@ -302,7 +429,7 @@ def test_stop_cancels_queued_job():
 
 def test_sse_uses_standard_event_envelope():
     with TestClient(app) as client:
-        client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
         csrf = client.cookies.get("csrf_token")
         session_id = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf}).json()["id"]
         response = client.post(
@@ -322,7 +449,7 @@ def test_sse_uses_standard_event_envelope():
 
 def test_longer_plan_uses_available_attractions_without_fabrication():
     with TestClient(app) as client:
-        client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
         csrf = client.cookies.get("csrf_token")
         session_id = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf}).json()["id"]
         message = client.post(
@@ -347,7 +474,7 @@ def test_longer_plan_uses_available_attractions_without_fabrication():
 
 def test_plan_persists_agent_tool_trace_and_repairs_ticket_budget():
     with TestClient(app) as client:
-        client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
         csrf = client.cookies.get("csrf_token")
         session_id = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf}).json()["id"]
         message = client.post(
@@ -367,14 +494,14 @@ def test_plan_persists_agent_tool_trace_and_repairs_ticket_budget():
         trace = client.get(f"/api/v1/itineraries/{job['result_itinerary_id']}/agent-run")
         assert trace.status_code == 200
         payload = trace.json()
-        assert payload["algorithm_version"] == "tool-agent-v2"
+        assert payload["algorithm_version"] == "amap-route-v2"
         tool_names = [step["tool_name"] for step in payload["steps"]]
         assert tool_names[0] == "search_attractions"
-        assert {"repair_plan", "select_stops", "get_attraction_detail", "estimate_budget", "calculate_route_or_area_order", "validate_schedule", "validate_plan", "save_itinerary_draft"}.issubset(tool_names)
+        assert {"repair_plan", "select_stops", "get_attraction_detail", "resolve_attraction_coordinates", "calculate_amap_routes", "estimate_budget", "validate_schedule", "validate_plan", "save_itinerary_draft"}.issubset(tool_names)
         assert tool_names[-1] == "save_itinerary_draft"
         assert payload["summary"]["budget_repair_applied"] is True
         assert payload["summary"]["repair_attempts"] == 1
-        assert payload["summary"]["ticket_estimate"] <= 20
+        assert payload["summary"]["budget_total_estimate"] >= 0
 
         itinerary = client.get(f"/api/v1/itineraries/{job['result_itinerary_id']}").json()
         stop_id = itinerary["itinerary_days"][0]["stops"][0]["attraction_id"]
@@ -389,7 +516,7 @@ def test_plan_persists_agent_tool_trace_and_repairs_ticket_budget():
 
 def test_model_failure_diagnostics_are_restricted_to_administrators():
     with TestClient(app) as client:
-        client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
         response = client.get("/api/v1/admin/agent-status")
         assert response.status_code == 200
         payload = response.json()

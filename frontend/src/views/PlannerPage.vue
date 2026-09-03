@@ -11,6 +11,8 @@ type MessagePayload = {
   city?: string
   destination?: string
   destination_city_id?: number
+  origin_city_id?: number
+  origin?: string
   days?: number
   traveler_count?: number
   interests?: string[]
@@ -18,12 +20,13 @@ type MessagePayload = {
   pace?: string
   budget_total?: number | null
   transport?: string
+  start_date?: string | null
   confirmed_job_id?: number
 }
 type Message = { id?: number; role: string; content: string; payload?: MessagePayload }
 type ServerEvent = { event_id: number | null; session_id: string; turn_id: string | null; type: string; payload: Record<string, unknown> }
 type AgentStatus = { mode: 'llm' | 'local'; state: 'disabled' | 'configured' | 'connected' | 'degraded'; model: string | null; label: string }
-type PlanDraft = { destination_city_id: number | null; destination: string; days: number; traveler_count: number; budget_total: number | null; interests: string; avoid_places: string; pace: 'relaxed' | 'balanced' | 'packed'; transport: 'public_transport' | 'taxi' | 'walking' | 'driving' }
+type PlanDraft = { origin_city_id: number | null; destination_city_id: number | null; destination: string; days: number; traveler_count: number; start_date: string; budget_total: number | null; interests: string; avoid_places: string; pace: 'relaxed' | 'balanced' | 'packed'; transport: 'public_transport' | 'taxi' | 'walking' | 'driving' }
 const router = useRouter()
 const messages = ref<Message[]>([{ role: 'assistant', content: '你好，我是行旅规划助手。我们可以先聊聊你的旅行喜好；需要规划时告诉我，我会收集完整需求并请你确认。' }])
 const input = ref('')
@@ -58,7 +61,7 @@ const activeSessionKey = 'travel-planner-active-session'
 const eventCursorKey = (id: number) => `travel-planner-event-${id}`
 
 function blankRequirement(): PlanDraft {
-  return { destination_city_id: null, destination: '', days: 3, traveler_count: 1, budget_total: null, interests: '', avoid_places: '', pace: 'balanced', transport: 'public_transport' }
+  return { origin_city_id: null, destination_city_id: null, destination: '', days: 3, traveler_count: 1, start_date: new Date().toISOString().slice(0, 10), budget_total: null, interests: '', avoid_places: '', pace: 'balanced', transport: 'public_transport' }
 }
 
 function splitList(value: string) {
@@ -252,9 +255,11 @@ function applyRequirement(payload: MessagePayload) {
   const matchedCity = cities.value.find((city) => city.id === payload.destination_city_id || city.name === payload.destination)
   requirementDraft.value = {
     destination_city_id: payload.destination_city_id || matchedCity?.id || null,
+    origin_city_id: payload.origin_city_id || cities.value.find((city) => city.name === payload.origin)?.id || null,
     destination: payload.destination || matchedCity?.name || '',
     days: payload.days || 3,
     traveler_count: payload.traveler_count || 1,
+    start_date: payload.start_date || new Date().toISOString().slice(0, 10),
     budget_total: payload.budget_total ?? null,
     interests: (payload.interests || []).join('、'),
     avoid_places: (payload.avoid_places || []).join('、'),
@@ -268,6 +273,14 @@ async function confirmPlan(payload?: MessagePayload) {
     messages.value.push({ role: 'assistant', content: '请先在右侧需求清单中选择目的地。' })
     return
   }
+  if (!requirementDraft.value.origin_city_id) {
+    messages.value.push({ role: 'assistant', content: '请选择出发城市后再生成行程，这样才能计算往返跨城路线和费用。' })
+    return
+  }
+  if (requirementDraft.value.origin_city_id !== requirementDraft.value.destination_city_id && requirementDraft.value.transport === 'walking') {
+    messages.value.push({ role: 'assistant', content: '跨城行程不支持步行方式，请选择公共交通、打车或自驾。' })
+    return
+  }
   sending.value = true
   stage.value = '正在提交已确认的需求'
   try {
@@ -275,9 +288,11 @@ async function confirmPlan(payload?: MessagePayload) {
       method: 'POST',
       headers: { 'Idempotency-Key': crypto.randomUUID() },
       body: JSON.stringify({ confirmed: true, patch: {
+        origin_city_id: requirementDraft.value.origin_city_id,
         destination_city_id: requirementDraft.value.destination_city_id,
         days: Number(requirementDraft.value.days),
         traveler_count: Number(requirementDraft.value.traveler_count),
+        start_date: requirementDraft.value.start_date,
         budget_total: requirementDraft.value.budget_total,
         interests: splitList(requirementDraft.value.interests),
         avoid_places: splitList(requirementDraft.value.avoid_places),
@@ -414,11 +429,13 @@ onBeforeUnmount(() => { eventSource?.close(); eventSource = null })
               <div v-if="message.payload?.type === 'plan_confirm'" class="confirm-card">
                 <dl>
                   <div><dt>目的地</dt><dd>{{ message.payload.destination }}</dd></div>
+                  <div><dt>出发城市</dt><dd>{{ message.payload.origin || '请在右侧补充' }}</dd></div>
                   <div><dt>天数</dt><dd>{{ message.payload.days }} 天</dd></div>
                   <div><dt>人数</dt><dd>{{ message.payload.traveler_count }} 人</dd></div>
+                  <div><dt>出发日期</dt><dd>{{ message.payload.start_date || '请在右侧补充' }}</dd></div>
                   <div><dt>偏好</dt><dd>{{ message.payload.interests?.join('、') }}</dd></div>
                 </dl>
-                <small>可在右侧清单修改条件；当前预算只计算门票。</small>
+                <small>可在右侧清单修改条件；预算会纳入往返跨城、景点间交通、门票、餐饮和住宿估算。</small>
                 <div class="confirm-actions">
                   <button class="primary-button" :disabled="archivedView || sending || !!message.payload.confirmed_job_id" @click="confirmPlan(message.payload)">{{ message.payload.confirmed_job_id ? '已确认' : '确认并生成行程' }}</button>
                   <button class="secondary-button" :disabled="archivedView || sending || !!message.payload.confirmed_job_id" @click="modifyPlan(message.payload)">在右侧修改</button>
@@ -441,7 +458,9 @@ onBeforeUnmount(() => { eventSource?.close(); eventSource = null })
         <div class="summary-heading"><span class="eyebrow">TRIP BRIEF</span><h2>旅行需求清单</h2></div>
         <form class="brief-form" @submit.prevent="confirmPlan(pendingConfirmation || undefined)">
           <label>目的地<select v-model.number="requirementDraft.destination_city_id" :disabled="briefLocked"><option :value="null" disabled>待确定</option><option v-for="city in cities" :key="city.id" :value="city.id" :disabled="!city.planning_enabled">{{ city.name }}</option></select></label>
+          <label>出发城市<select v-model.number="requirementDraft.origin_city_id" :disabled="briefLocked"><option :value="null" disabled>请选择出发城市</option><option v-for="city in cities" :key="city.id" :value="city.id">{{ city.name }}</option></select></label>
           <div class="brief-pair"><label>天数<input v-model.number="requirementDraft.days" type="number" min="2" max="5" :disabled="briefLocked" /></label><label>人数<input v-model.number="requirementDraft.traveler_count" type="number" min="1" max="20" :disabled="briefLocked" /></label></div>
+          <label>出发日期<input v-model="requirementDraft.start_date" type="date" :disabled="briefLocked" /></label>
           <label>预算<input :value="requirementDraft.budget_total ?? ''" type="number" min="0" placeholder="待补充" :disabled="briefLocked" @input="requirementDraft.budget_total = ($event.target as HTMLInputElement).value ? Number(($event.target as HTMLInputElement).value) : null" /></label>
           <label>兴趣偏好<input v-model="requirementDraft.interests" placeholder="例如：摄影、美食" :disabled="briefLocked" /></label>
           <label>不想去的地方<input v-model="requirementDraft.avoid_places" placeholder="例如：过度拥挤" :disabled="briefLocked" /></label>

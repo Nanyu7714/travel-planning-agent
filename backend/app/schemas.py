@@ -52,6 +52,11 @@ class EmailRequestIn(BaseModel):
     email: EmailStr
 
 
+class EmailVerificationIn(BaseModel):
+    email: EmailStr
+    code: str = Field(pattern=r"^\d{6}$")
+
+
 class AuthTokenIn(BaseModel):
     token: str = Field(min_length=32, max_length=256)
 
@@ -63,6 +68,10 @@ class PasswordResetIn(AuthTokenIn):
 class AuthActionOut(BaseModel):
     message: str
     dev_action_url: str | None = None
+    dev_verification_code: str | None = None
+    masked_email: str | None = None
+    expires_in_seconds: int | None = None
+    retry_after_seconds: int | None = None
 
 
 class AccountDeleteIn(BaseModel):
@@ -232,6 +241,29 @@ class AdminAuditLogPageOut(BaseModel):
     page_size: int
 
 
+class AdminEmailOutboxOut(BaseModel):
+    id: int
+    user_id: int | None
+    username: str | None
+    purpose: str
+    recipient_masked: str
+    subject: str
+    status: str
+    attempt_count: int
+    retry_count: int
+    last_error_code: str | None
+    sent_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdminEmailOutboxPageOut(BaseModel):
+    items: list[AdminEmailOutboxOut]
+    total: int
+    page: int
+    page_size: int
+
+
 class MediaAssetOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -264,6 +296,28 @@ class MediaAssetUpdateIn(BaseModel):
     attribution_url: str | None = Field(default=None, max_length=1000)
     verification_status: Literal["approved", "needs_review", "missing", "rejected_wrong_city"] | None = None
     is_active: bool | None = None
+
+
+class MediaAssetBulkUpdateIn(BaseModel):
+    asset_ids: list[int] = Field(min_length=1, max_length=100)
+    verification_status: Literal["approved", "needs_review", "missing", "rejected_wrong_city"] | None = None
+    is_active: bool | None = None
+
+
+class AdminPhotoFetchIn(BaseModel):
+    city_id: int = Field(ge=1)
+    attraction_id: int | None = Field(default=None, ge=1)
+    keyword: str = Field(min_length=1, max_length=120)
+    limit: int = Field(default=3, ge=1, le=10)
+    auto_approve: bool = False
+
+
+class AdminPhotoFetchOut(BaseModel):
+    keyword: str
+    fetched: int
+    skipped: int
+    providers: list[str]
+    items: list[MediaAssetOut]
 
 
 class PageOut(BaseModel):
@@ -367,8 +421,10 @@ class MessageIn(BaseModel):
 
 
 class PlanRequirementPatchIn(BaseModel):
+    origin_city_id: int | None = Field(default=None, ge=1)
     destination_city_id: int | None = Field(default=None, ge=1)
     days: int | None = Field(default=None, ge=2, le=5)
+    start_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     budget_total: int | None = Field(default=None, ge=0, le=10_000_000)
     interests: list[str] | None = Field(default=None, max_length=20)
     avoid_places: list[str] | None = Field(default=None, max_length=20)
@@ -470,6 +526,16 @@ class FeedbackOut(BaseModel):
     updated_at: datetime
 
 
+class FeedbackSummaryOut(BaseModel):
+    rating: int | None
+    comment: str
+    average: float | None
+    count: int
+    status: Literal["open", "in_progress", "resolved"] | None
+    admin_reply: str | None
+    replied_at: datetime | None
+
+
 class CommunityPostCreateIn(BaseModel):
     itinerary_id: int = Field(ge=1)
     title: str = Field(min_length=1, max_length=120)
@@ -517,6 +583,12 @@ class AdminFeedbackOut(BaseModel):
     itinerary_title: str
     rating: int
     comment: str
+    status: Literal["open", "in_progress", "resolved"]
+    assigned_admin_id: int | None
+    assigned_admin_username: str | None
+    admin_reply: str | None
+    replied_at: datetime | None
+    handled_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -526,3 +598,41 @@ class AdminFeedbackPageOut(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class AdminFeedbackUpdateIn(BaseModel):
+    status: Literal["open", "in_progress", "resolved"] | None = None
+    assigned_admin_id: int | None = Field(default=None, ge=1)
+    admin_reply: str | None = Field(default=None, max_length=2000)
+
+
+class AdminFeedbackAssigneeOut(BaseModel):
+    id: int
+    username: str
+
+
+class KnowledgeDocumentIn(BaseModel):
+    city_id: int = Field(ge=1)
+    title: str = Field(min_length=1, max_length=160)
+    source_name: str = Field(min_length=1, max_length=160)
+    source_url: str | None = Field(default=None, max_length=1000)
+    license_note: str | None = Field(default=None, max_length=500)
+    content: str = Field(min_length=80, max_length=30000)
+
+
+class KnowledgeDocumentUpdateIn(KnowledgeDocumentIn):
+    status: Literal["needs_review", "approved", "rejected", "archived"]
+
+
+class AdminKnowledgeDocumentOut(BaseModel):
+    id: int
+    city_id: int
+    city_name: str
+    title: str
+    source_name: str
+    source_url: str | None
+    license_note: str | None
+    content: str
+    status: str
+    chunk_count: int
+    updated_at: datetime

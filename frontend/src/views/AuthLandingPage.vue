@@ -12,7 +12,6 @@ const mode = ref<AuthMode>('login')
 const submitting = ref(false)
 const error = ref('')
 const notice = ref('')
-const devActionUrl = ref('')
 const fieldErrors = ref<Record<string, string>>({})
 const loginForm = ref({ account: '', password: '' })
 const registerForm = ref({ username: '', email: '', password: '' })
@@ -34,7 +33,6 @@ function switchMode(nextMode: AuthMode) {
   mode.value = nextMode
   error.value = ''
   notice.value = ''
-  devActionUrl.value = ''
   fieldErrors.value = {}
 }
 
@@ -57,16 +55,14 @@ async function submit() {
   if (submitting.value) return
   error.value = ''
   notice.value = ''
-  devActionUrl.value = ''
   fieldErrors.value = {}
   if (mode.value === 'register' && !validateRegistration()) return
   submitting.value = true
   try {
     if (mode.value === 'register') {
-      const result = await registerAccount(registerForm.value.username.trim(), registerForm.value.email.trim(), registerForm.value.password)
-      notice.value = result.message
-      devActionUrl.value = result.dev_action_url || ''
-      registerForm.value.password = ''
+      const registrationEmail = registerForm.value.email.trim()
+      await registerAccount(registerForm.value.username.trim(), registrationEmail, registerForm.value.password)
+      await router.push({ name: 'auth-verify', query: { email: registrationEmail } })
     } else {
       await api<CurrentUser>('/auth/login', { method: 'POST', body: JSON.stringify({ account: loginForm.value.account.trim(), password: loginForm.value.password }) })
       window.dispatchEvent(new Event('auth-signed-in'))
@@ -138,8 +134,7 @@ function resetScene() {
           </template>
           <p v-if="error" class="auth-entry__error">{{ error }}</p>
           <p v-if="notice" class="auth-entry__notice">{{ notice }}</p>
-          <a v-if="devActionUrl" class="auth-entry__dev-link" :href="devActionUrl">打开本地测试邮件链接</a>
-          <button class="auth-entry__submit" type="submit" :disabled="submitting">{{ submitting ? '正在处理...' : mode === 'login' ? '登录并继续' : '注册并发送验证邮件' }}<ArrowRight :size="17" /></button>
+          <button class="auth-entry__submit" type="submit" :disabled="submitting">{{ submitting ? '正在处理...' : mode === 'login' ? '登录并继续' : '创建账号' }}<ArrowRight :size="17" /></button>
           <div v-if="mode === 'login'" class="auth-entry__help-links"><RouterLink to="/auth/forgot-password">忘记密码</RouterLink><RouterLink to="/auth/resend-verification">重新发送验证邮件</RouterLink></div>
         </form>
 

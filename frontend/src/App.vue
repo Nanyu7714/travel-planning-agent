@@ -18,7 +18,6 @@ const registerForm = ref({ username: '', email: '', password: '' })
 const authMode = ref<'login' | 'register'>('login')
 const loginError = ref('')
 const authNotice = ref('')
-const devActionUrl = ref('')
 const fieldErrors = ref<Record<string, string>>({})
 const pageTitle = computed(() => route.path === '/planner' ? 'AI 规划' : route.path === '/itineraries' ? '我的行程' : route.path === '/cities' ? '城市' : route.path === '/admin' ? '管理后台' : '发现')
 const isEntryPage = computed(() => route.name === 'entry')
@@ -48,12 +47,12 @@ async function login() {
   }
   authSubmitting.value = true
   try {
-    authNotice.value = ''; devActionUrl.value = ''
+    authNotice.value = ''
     if (authMode.value === 'register') {
-      const result = await registerAccount(registerForm.value.username.trim(), registerForm.value.email.trim(), registerForm.value.password)
-      authNotice.value = result.message
-      devActionUrl.value = result.dev_action_url || ''
-      registerForm.value.password = ''
+      const registrationEmail = registerForm.value.email.trim()
+      await registerAccount(registerForm.value.username.trim(), registrationEmail, registerForm.value.password)
+      loginOpen.value = false
+      await router.push({ name: 'auth-verify', query: { email: registrationEmail } })
     } else {
       account.value = await api<CurrentUser>('/auth/login', { method: 'POST', body: JSON.stringify(form.value) })
       loginOpen.value = false
@@ -67,11 +66,11 @@ async function login() {
 function clearFieldError(field: string) {
   if (fieldErrors.value[field]) delete fieldErrors.value[field]
 }
-function switchAuthMode(mode: 'login' | 'register') { authMode.value = mode; loginError.value = ''; authNotice.value = ''; devActionUrl.value = ''; fieldErrors.value = {} }
+function switchAuthMode(mode: 'login' | 'register') { authMode.value = mode; loginError.value = ''; authNotice.value = ''; fieldErrors.value = {} }
 async function logout() { closeMenus(); await api('/auth/logout', { method: 'POST' }).catch(() => undefined); account.value = null; router.push('/') }
 function closeMenus() { menuOpen.value = false; profileMenuOpen.value = false }
-function handleKeydown(event: KeyboardEvent) { if (event.key === 'Escape') { if (loginOpen.value) loginOpen.value = false; else closeMenus() } }
-watch(loginOpen, async (open) => { if (open) { await nextTick(); authCloseButton.value?.focus() } else { fieldErrors.value = {}; loginError.value = ''; authNotice.value = ''; devActionUrl.value = '' } })
+function handleKeydown(event: KeyboardEvent) { if (event.key === 'Escape' && !loginOpen.value) closeMenus() }
+watch(loginOpen, async (open) => { if (open) { await nextTick(); authCloseButton.value?.focus() } else { fieldErrors.value = {}; loginError.value = ''; authNotice.value = '' } })
 onMounted(() => { window.addEventListener('auth-expired', handleAuthExpired); window.addEventListener('account-deleted', handleAccountDeleted); window.addEventListener('auth-signed-out', handleSignedOut); window.addEventListener('auth-signed-in', handleSignedIn); document.addEventListener('click', closeMenus); document.addEventListener('keydown', handleKeydown); void loadUser() })
 onBeforeUnmount(() => { window.removeEventListener('auth-expired', handleAuthExpired); window.removeEventListener('account-deleted', handleAccountDeleted); window.removeEventListener('auth-signed-out', handleSignedOut); window.removeEventListener('auth-signed-in', handleSignedIn); document.removeEventListener('click', closeMenus); document.removeEventListener('keydown', handleKeydown) })
 </script>
@@ -101,7 +100,7 @@ onBeforeUnmount(() => { window.removeEventListener('auth-expired', handleAuthExp
   <main>
     <RouterView />
   </main>
-  <div v-if="loginOpen" class="modal-backdrop" @click.self="loginOpen = false">
+  <div v-if="loginOpen" class="modal-backdrop">
     <section class="modal-panel auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-title">
       <div class="auth-modal__header"><div><span class="eyebrow">{{ authMode === 'login' ? 'WELCOME BACK' : 'JOIN THE JOURNEY' }}</span><h2 id="auth-title">{{ authMode === 'login' ? '登录行旅' : '注册行旅账号' }}</h2></div><button ref="authCloseButton" class="icon-button auth-close" aria-label="关闭登录窗口" title="关闭" @click="loginOpen = false"><X :size="18" /></button></div>
       <div class="auth-tabs" role="tablist" aria-label="认证方式"><button type="button" role="tab" :aria-selected="authMode === 'login'" :class="{ active: authMode === 'login' }" @click="switchAuthMode('login')">登录</button><button type="button" role="tab" :aria-selected="authMode === 'register'" :class="{ active: authMode === 'register' }" @click="switchAuthMode('register')">注册</button></div>
@@ -117,11 +116,10 @@ onBeforeUnmount(() => { window.removeEventListener('auth-expired', handleAuthExp
         </template>
         <p v-if="loginError" class="form-error">{{ loginError }}</p>
         <p v-if="authNotice" class="helper-text">{{ authNotice }}</p>
-        <a v-if="devActionUrl" class="auth-dev-link" :href="devActionUrl">打开本地测试邮件链接</a>
-        <button class="primary-button wide" type="submit" :disabled="authSubmitting">{{ authSubmitting ? '正在处理...' : authMode === 'login' ? '登录' : '注册并发送验证邮件' }}</button>
+        <button class="primary-button wide" type="submit" :disabled="authSubmitting">{{ authSubmitting ? '正在处理...' : authMode === 'login' ? '登录' : '创建账号' }}</button>
         <div v-if="authMode === 'login'" class="auth-help-links"><RouterLink to="/auth/forgot-password" @click="loginOpen = false">忘记密码</RouterLink><RouterLink to="/auth/resend-verification" @click="loginOpen = false">重新发送验证邮件</RouterLink></div>
       </form>
-      <p class="helper-text auth-switch">{{ authMode === 'login' ? '登录后可以保存城市、景点和行程。' : '注册后可以保存你的旅行偏好和行程。' }}</p>
+      <p class="helper-text auth-switch">{{ authMode === 'login' ? '登录后可以保存城市、景点和行程。' : '创建账号后，再单独发送 6 位邮箱验证码。' }}</p>
     </section>
   </div>
   <footer class="footer"><span>行旅 · 让每一段出发，都有清晰的下一站</span><span>数据来源与更新时间以页面展示为准</span></footer>

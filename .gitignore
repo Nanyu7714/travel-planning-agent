@@ -33,6 +33,7 @@ Thumbs.db
 # Local task logs and commit helpers
 .tmp/
 *-dev.log
+*-dev-error.log
 .commitmsg.txt
 .logcheck.txt
 .logcheck2.txt

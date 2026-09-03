@@ -89,7 +89,9 @@ LLM_MAX_TOKENS=500
 
 未配置 `LLM_API_KEY` 时，页面会明确显示“使用本地对话模式”；首次模型请求成功后显示“已连接”，调用失败则自动降级且不会影响城市浏览和规则规划。
 
-认证邮件在开发环境默认使用本地模式，注册、找回密码和修改邮箱后页面会显示一次性的本地测试链接。生产环境应设置 `ENVIRONMENT=production`、`MAIL_DELIVERY_MODE=smtp`、`MAIL_FROM`、`SMTP_HOST`、`SMTP_PORT`、`SMTP_USERNAME`、`SMTP_PASSWORD` 和 `SMTP_STARTTLS`；这些值只允许保存在服务器环境变量中。项目不会自动修改 `.env`。
+认证邮件在开发环境默认使用本地模式：注册后需要在独立验证页发送 6 位验证码，验证码 3 分钟有效；找回密码和修改邮箱仍使用一次性本地测试链接。生产环境应设置 `ENVIRONMENT=production`、`MAIL_DELIVERY_MODE=smtp`、`MAIL_FROM`、`SMTP_HOST`、`SMTP_PORT`、`SMTP_USERNAME`、`SMTP_PASSWORD` 和 `SMTP_STARTTLS`；这些值只允许保存在服务器环境变量中。项目不会自动修改 `.env`。
+
+使用 Brevo 发送注册验证等事务邮件时，可以参考 `backend/.env.example` 中的 Brevo SMTP 模板：将 `MAIL_DELIVERY_MODE` 改为 `smtp`，把 `MAIL_FROM` 替换为 Brevo 中已经验证的发件地址，把 Brevo 后台显示的 SMTP Login 和 SMTP Key 分别填入 `SMTP_USERNAME`、`SMTP_PASSWORD`。模板使用 `smtp-relay.brevo.com:587` 和 STARTTLS；SMTP Key 不是 Brevo 登录密码或 API Key，也不能提交到 Git。
 
 ## 测试和构建
 

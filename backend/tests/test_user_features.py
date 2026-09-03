@@ -1,13 +1,13 @@
+import os
 import re
 import uuid
-from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 
 from app.db import SessionLocal
 from app.main import app
 from app.models import CommunityPost, Favorite, Itinerary, ItineraryDay, ItineraryStop, ShareLink, User, UserProfile
-from conftest import register_and_login
+from conftest import register_and_login, verification_code
 
 
 def test_legacy_profile_null_lists_are_normalized():
@@ -220,7 +220,7 @@ def test_itinerary_soft_delete_admin_restore_and_protected_hard_delete():
         finally:
             db.close()
 
-        assert client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"}).status_code == 200
+        assert client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]}).status_code == 200
         admin_headers = {"X-CSRF-Token": client.cookies.get("csrf_token")}
         deleted_page = client.get("/api/v1/admin/itineraries?state=deleted&page=1&page_size=10")
         assert deleted_page.status_code == 200
@@ -239,7 +239,7 @@ def test_itinerary_soft_delete_admin_restore_and_protected_hard_delete():
         assert client.get(f"/api/v1/itineraries/{retained_id}").status_code == 200
         assert client.delete(f"/api/v1/itineraries/{disposable_id}", headers=user_headers).status_code == 204
 
-        assert client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"}).status_code == 200
+        assert client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]}).status_code == 200
         admin_headers = {"X-CSRF-Token": client.cookies.get("csrf_token")}
         disposable_row = next(
             item for item in client.get("/api/v1/admin/itineraries?state=deleted&page=1&page_size=10").json()["items"]
@@ -322,8 +322,9 @@ def test_community_post_snapshot_interactions_and_withdrawal():
             json={"username": owner_name, "email": f"{owner_name}@example.com", "password": "test123456"},
         )
         assert owner_registration.status_code == 202
-        owner_token = parse_qs(urlparse(owner_registration.json()["dev_action_url"]).query)["token"][0]
-        assert client.post("/api/v1/auth/verify-email", json={"token": owner_token}).status_code == 200
+        owner_email = f"{owner_name}@example.com"
+        owner_code = verification_code(client.post("/api/v1/auth/send-verification-code", json={"email": owner_email}))
+        assert client.post("/api/v1/auth/verify-email", json={"email": owner_email, "code": owner_code}).status_code == 200
         assert client.post("/api/v1/auth/login", json={"account": owner_name, "password": "test123456"}).status_code == 200
         owner_headers = {"X-CSRF-Token": client.cookies.get("csrf_token")}
 
@@ -358,8 +359,9 @@ def test_community_post_snapshot_interactions_and_withdrawal():
             json={"username": other_name, "email": f"{other_name}@example.com", "password": "test123456"},
         )
         assert other_registration.status_code == 202
-        other_token = parse_qs(urlparse(other_registration.json()["dev_action_url"]).query)["token"][0]
-        assert client.post("/api/v1/auth/verify-email", json={"token": other_token}).status_code == 200
+        other_email = f"{other_name}@example.com"
+        other_code = verification_code(client.post("/api/v1/auth/send-verification-code", json={"email": other_email}))
+        assert client.post("/api/v1/auth/verify-email", json={"email": other_email, "code": other_code}).status_code == 200
         assert client.post("/api/v1/auth/login", json={"account": other_name, "password": "test123456"}).status_code == 200
         other_headers = {"X-CSRF-Token": client.cookies.get("csrf_token")}
         assert client.put(f"/api/v1/community/posts/{post_id}/like", json={}, headers=other_headers).status_code == 200

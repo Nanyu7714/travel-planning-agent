@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { ArrowRight, CalendarDays, ChevronLeft, ChevronRight, Compass, MapPin, Search, Sparkles, TrendingUp } from 'lucide-vue-next'
-import { getAttractions, getCities, getRankings, searchCities, type Attraction, type City, type Ranking } from '../api'
+import { getAttractions, getCities, getRankings, searchAttractions, searchCities, type Attraction, type City, type Ranking } from '../api'
 import PopularCityCard from '../components/PopularCityCard.vue'
 
+const router = useRouter()
 const cities = ref<City[]>([])
 const attractions = ref<Attraction[]>([])
 const rankings = ref<Ranking[]>([])
@@ -13,7 +15,10 @@ const selectedCity = ref<City | null>(null)
 const loading = ref(true)
 const loadError = ref('')
 const searchQuery = ref('')
-const searchedCities = ref<City[] | null>(null)
+const searchedCities = ref<City[]>([])
+const searchedAttractions = ref<Attraction[]>([])
+const searchMenuOpen = ref(false)
+const searchPending = ref(false)
 const heroImageIndex = ref(0)
 const failedHeroImageUrls = ref<string[]>([])
 const localHeroImages = [
@@ -51,6 +56,8 @@ let activePointerId: number | null = null
 let dragStartX = 0
 let dragStartScrollLeft = 0
 let shouldSuppressRailClick = false
+let searchTimer: number | undefined
+let searchRequestId = 0
 
 function updatePopularRailState() {
   const rail = popularRail.value
@@ -113,10 +120,61 @@ async function loadAttractionCounts(cityList: City[]) {
   }))
   attractionCounts.value = Object.fromEntries(entries)
 }
+function resetSearchResults() {
+  searchedCities.value = []
+  searchedAttractions.value = []
+  searchPending.value = false
+}
+function closeSearch() {
+  searchMenuOpen.value = false
+}
+async function lookupSearch(query = searchQuery.value.trim()) {
+  if (!query) {
+    resetSearchResults()
+    return
+  }
+  const requestId = ++searchRequestId
+  searchPending.value = true
+  const [cityResult, attractionResult] = await Promise.allSettled([searchCities(query), searchAttractions(query)])
+  if (requestId !== searchRequestId) return
+  searchedCities.value = cityResult.status === 'fulfilled' ? cityResult.value.slice(0, 5) : []
+  searchedAttractions.value = attractionResult.status === 'fulfilled' ? attractionResult.value.slice(0, 5) : []
+  searchPending.value = false
+}
+function handleSearchInput() {
+  searchMenuOpen.value = true
+  if (searchTimer) window.clearTimeout(searchTimer)
+  const query = searchQuery.value.trim()
+  if (!query) {
+    resetSearchResults()
+    return
+  }
+  searchTimer = window.setTimeout(() => { void lookupSearch(query) }, 220)
+}
+function openSearch() {
+  if (searchQuery.value.trim()) {
+    searchMenuOpen.value = true
+    if (!searchedCities.value.length && !searchedAttractions.value.length) void lookupSearch()
+  }
+}
+function goToCity(city: City) {
+  closeSearch()
+  void router.push(`/cities/${city.slug}`)
+}
+function goToAttraction(attraction: Attraction) {
+  closeSearch()
+  void router.push(`/attractions/${attraction.id}`)
+}
 async function search() {
   const query = searchQuery.value.trim()
-  searchedCities.value = query ? await searchCities(query) : null
-  if (searchedCities.value?.[0]) await selectCity(searchedCities.value[0])
+  if (!query) return
+  if (searchTimer) window.clearTimeout(searchTimer)
+  await lookupSearch(query)
+  const exactCity = searchedCities.value.find((city) => city.name === query || city.slug.toLowerCase() === query.toLowerCase())
+  const exactAttraction = searchedAttractions.value.find((attraction) => attraction.name === query)
+  if (exactCity || searchedCities.value[0]) goToCity(exactCity || searchedCities.value[0])
+  else if (exactAttraction || searchedAttractions.value[0]) goToAttraction(exactAttraction || searchedAttractions.value[0])
+  else searchMenuOpen.value = true
 }
 onMounted(async () => {
   preloadHeroImages()
@@ -138,7 +196,10 @@ onMounted(async () => {
   }
 })
 
-onBeforeUnmount(() => window.removeEventListener('resize', updatePopularRailState))
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', updatePopularRailState)
+  if (searchTimer) window.clearTimeout(searchTimer)
+})
 
 watch(heroImages, (images) => {
   if (heroImageIndex.value >= images.length) heroImageIndex.value = 0
@@ -188,11 +249,29 @@ function handleHeroImageError(imageUrl: string) {
         <span class="home-hero__eyebrow">TRAVEL, BETTER PLANNED</span>
         <h1 id="home-title">下一站，去值得走一走的地方。</h1>
         <p>从一座城市开始，把想去的地方变成走得通、玩得好的行程。</p>
-        <form class="home-search" @submit.prevent="search">
-          <Search :size="18" aria-hidden="true" />
-          <input v-model="searchQuery" placeholder="搜索城市" aria-label="搜索城市" />
-          <button type="submit" aria-label="搜索城市" title="搜索城市"><Search :size="17" /></button>
-        </form>
+        <div class="home-search-area">
+          <form class="home-search" @submit.prevent="search">
+            <Search :size="18" aria-hidden="true" />
+            <input v-model="searchQuery" placeholder="搜索城市或景点" aria-label="搜索城市或景点" @input="handleSearchInput" @focus="openSearch" @keydown.esc.prevent="closeSearch" />
+            <button type="submit" aria-label="搜索城市或景点" title="搜索"><Search :size="17" /></button>
+          </form>
+          <div v-if="searchMenuOpen && searchQuery.trim()" class="home-search-results" role="listbox" aria-label="搜索结果">
+            <div v-if="searchPending" class="home-search-results__status">正在搜索...</div>
+            <template v-else-if="searchedCities.length || searchedAttractions.length">
+              <button v-for="city in searchedCities" :key="`city-${city.id}`" type="button" class="home-search-result" role="option" @click="goToCity(city)">
+                <MapPin :size="17" aria-hidden="true" />
+                <span><strong>{{ city.name }}</strong><small>城市 · {{ city.season }}</small></span>
+                <ArrowRight :size="16" aria-hidden="true" />
+              </button>
+              <button v-for="attraction in searchedAttractions" :key="`attraction-${attraction.id}`" type="button" class="home-search-result" role="option" @click="goToAttraction(attraction)">
+                <Compass :size="17" aria-hidden="true" />
+                <span><strong>{{ attraction.name }}</strong><small>景点 · {{ attraction.area }}</small></span>
+                <ArrowRight :size="16" aria-hidden="true" />
+              </button>
+            </template>
+            <div v-else class="home-search-results__status">没有找到相关城市或景点</div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -331,11 +410,21 @@ function handleHeroImageError(imageUrl: string) {
 .home-hero__eyebrow { margin-bottom: 12px; color: var(--color-on-dark); font-size: 11px; font-weight: 700; letter-spacing: 1.6px; }
 .home-hero h1 { max-width: 540px; margin: 0 0 12px; color: var(--color-on-dark); font-size: 28px; font-weight: 700; line-height: 1.43; }
 .home-hero p { max-width: 460px; margin: 0 0 24px; color: rgba(255, 255, 255, 0.92); font-size: 16px; line-height: 1.5; }
-.home-search { display: flex; width: min(100%, 420px); min-height: 64px; align-items: center; gap: 10px; padding: 8px 8px 8px 20px; border: 1px solid var(--color-border); border-radius: var(--radius-pill); background: var(--color-canvas); color: var(--color-ink); box-shadow: var(--shadow-hover); }
+.home-search-area { position: relative; width: min(100%, 420px); }
+.home-search { display: flex; width: 100%; min-height: 64px; align-items: center; gap: 10px; padding: 8px 8px 8px 20px; border: 1px solid var(--color-border); border-radius: var(--radius-pill); background: var(--color-canvas); color: var(--color-ink); box-shadow: var(--shadow-hover); }
 .home-search input { min-width: 0; flex: 1; padding: 8px 0; border: 0; outline: 0; color: var(--color-ink); background: transparent; font-size: 14px; }
 .home-search input::placeholder { color: var(--color-muted); }
 .home-search button { display: grid; width: 48px; height: 48px; flex: none; place-items: center; border: 0; border-radius: var(--radius-pill); color: var(--color-on-primary); background: var(--color-primary); }
 .home-search button:hover { background: var(--color-primary-active); }
+.home-search-results { position: absolute; z-index: 4; top: calc(100% + 8px); right: 0; left: 0; overflow: hidden; border: 1px solid var(--color-border); border-radius: var(--radius-card); color: var(--color-ink); background: var(--color-canvas); box-shadow: var(--shadow-hover); }
+.home-search-result { display: grid; width: 100%; grid-template-columns: 20px minmax(0, 1fr) 18px; align-items: center; gap: 10px; padding: 12px 16px; border: 0; border-bottom: 1px solid var(--color-border-soft); color: var(--color-ink); background: transparent; text-align: left; }
+.home-search-result:last-child { border-bottom: 0; }
+.home-search-result:hover, .home-search-result:focus-visible { background: var(--color-surface-soft); outline: 0; }
+.home-search-result > span { display: grid; min-width: 0; gap: 2px; }
+.home-search-result strong, .home-search-result small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.home-search-result strong { font-size: 14px; line-height: 1.25; }
+.home-search-result small, .home-search-results__status { color: var(--color-muted); font-size: 12px; line-height: 1.4; }
+.home-search-results__status { padding: 16px; }
 .home-section { padding-top: 64px; }
 .section-heading__action { display: flex; align-items: center; gap: 20px; }
 .section-heading__action .underlined-link { margin-top: 0; }

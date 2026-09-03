@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { CheckCircle2, ImageOff, Pencil, RefreshCw, Save, Search, ShieldCheck, X } from 'lucide-vue-next'
+import { CheckCircle2, ImageOff, Images, Pencil, RefreshCw, Save, Search, ShieldCheck, Upload, X } from 'lucide-vue-next'
 import AdminModuleHeader from '../components/AdminModuleHeader.vue'
-import { api, getAttractions, getCities, type City } from '../api'
+import { api, getAttractions, getCities, type City, uploadMediaAssetFile } from '../api'
 
 type MediaStatus = 'approved' | 'needs_review' | 'missing' | 'rejected_wrong_city'
 type MediaAsset = {
@@ -139,6 +139,22 @@ function markImageFailed(id: number) {
   failedImageIds.value = new Set([...failedImageIds.value, id])
 }
 
+async function uploadFile(asset: MediaAsset, event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  busyId.value = asset.id
+  error.value = ''
+  try {
+    replaceAsset(await uploadMediaAssetFile(asset.id, file))
+  } catch (exception) {
+    error.value = exception instanceof Error ? exception.message : '图片上传失败'
+  } finally {
+    busyId.value = null
+    input.value = ''
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -153,6 +169,7 @@ onMounted(load)
           <button v-for="city in cities" :key="city.id" type="button" :class="['admin-filter-button', { active: selectedCityId === city.id }]" @click="selectedCityId = city.id">{{ city.name }}</button>
         </div>
         <div class="media-assets-toolbar__right">
+          <RouterLink class="photos-entry" to="/admin/photos"><Images :size="16" />相片库</RouterLink>
           <select v-model="selectedStatus" aria-label="核验状态筛选">
             <option value="all">全部状态</option>
             <option value="approved">已核验</option>
@@ -177,6 +194,10 @@ onMounted(load)
           </div>
           <div class="media-asset-actions">
             <a v-if="asset.attribution_url" :href="asset.attribution_url" target="_blank" rel="noreferrer">来源</a>
+            <label v-if="!asset.is_active" class="media-upload" title="上传本地图片（JPEG/PNG/WebP，≤8MB）">
+              <Upload :size="16" /><span class="sr-only">上传本地图片</span>
+              <input type="file" accept="image/jpeg,image/png,image/webp" :disabled="busyId === asset.id" @change="uploadFile(asset, $event)" />
+            </label>
             <button v-if="!asset.is_active" type="button" title="自动查找候选图片" :disabled="busyId === asset.id" @click="autofill(asset)"><RefreshCw :size="16" /></button>
             <button v-else type="button" title="停用展示" :disabled="busyId === asset.id" @click="toggleActive(asset)"><ImageOff :size="16" /></button>
             <button v-if="!asset.is_active && asset.verification_status === 'approved'" type="button" title="启用展示" :disabled="busyId === asset.id" @click="toggleActive(asset)"><CheckCircle2 :size="16" /></button>
@@ -210,7 +231,9 @@ onMounted(load)
 
 <style scoped>
 .media-assets-toolbar { align-items: flex-start; padding-bottom: 12px; }
-.media-assets-toolbar__right { display: flex; gap: 8px; }
+.media-assets-toolbar__right { display: flex; flex-wrap: wrap; gap: 8px; }
+.photos-entry { display: inline-flex; align-items: center; gap: 6px; min-height: 48px; padding: 0 14px; border: 1px solid var(--color-border); border-radius: var(--radius-control); color: var(--color-ink); font-size: 13px; white-space: nowrap; }
+.photos-entry:hover { border-color: var(--color-primary); color: var(--color-primary); }
 .media-assets-toolbar select { min-height: 48px; padding: 0 28px 0 12px; border: 1px solid var(--color-border); border-radius: var(--radius-control); background: var(--color-surface); color: var(--color-ink); }
 .media-assets-list { margin-top: 24px; border-top: 1px solid var(--color-border-soft); }
 .media-asset-row { display: grid; grid-template-columns: 120px minmax(0, 1fr) auto; gap: 20px; align-items: center; padding: 16px 0; border-bottom: 1px solid var(--color-border-soft); }
@@ -224,6 +247,10 @@ onMounted(load)
 .media-asset-actions a, .media-asset-actions button { display: grid; width: 40px; height: 40px; place-items: center; border: 0; border-radius: var(--radius-pill); color: var(--color-muted); background: transparent; font-size: 13px; }
 .media-asset-actions a:hover, .media-asset-actions button:hover:not(:disabled) { color: var(--color-primary); background: var(--color-surface-soft); }
 .media-asset-actions button:disabled { opacity: 0.45; }
+.media-asset-actions .media-upload { display: grid; width: 40px; height: 40px; place-items: center; border-radius: var(--radius-pill); color: var(--color-muted); background: transparent; cursor: pointer; }
+.media-asset-actions .media-upload:hover { color: var(--color-primary); background: var(--color-surface-soft); }
+.media-asset-actions .media-upload:has(input:disabled) { opacity: 0.45; pointer-events: none; }
+.media-upload input { display: none; }
 .media-asset-active { margin-left: 6px; color: var(--color-primary); }
 .media-editor { max-width: 920px; margin-top: 28px; padding: 24px; border: 1px solid var(--color-border-soft); border-radius: var(--radius-card); background: var(--color-surface); }.media-editor__body { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 24px; margin-top: 20px; }.media-editor__preview { min-height: 210px; display: grid; place-items: center; overflow: hidden; border-radius: var(--radius-card); background: var(--color-surface-soft); color: var(--color-muted); }.media-editor__preview img { width: 100%; height: 100%; object-fit: cover; }.media-editor__form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }.media-editor__form label { display: grid; gap: 6px; color: var(--color-muted); font-size: 12px; }.media-editor__form input, .media-editor__form select { min-width: 0; min-height: 44px; padding: 10px; border: 1px solid var(--color-border); border-radius: var(--radius-control); background: var(--color-surface); color: var(--color-ink); }.media-editor__form .media-editor__toggle { display: flex; align-items: center; gap: 8px; grid-column: 1 / -1; color: var(--color-ink); font-size: 14px; }.media-editor__form .media-editor__toggle input { min-height: auto; }.media-editor__form .primary-button { justify-self: end; }
 @media (max-width: 744px) { .media-assets-toolbar__right { width: 100%; }.media-assets-toolbar__right .admin-search { min-width: 0; flex: 1; }.media-asset-row { grid-template-columns: 84px minmax(0, 1fr); gap: 12px; }.media-asset-preview { width: 84px; }.media-asset-actions { grid-column: 2; }.media-asset-main p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.media-editor { padding: 18px; border-radius: var(--radius-control); }.media-editor__body { grid-template-columns: 1fr; }.media-editor__preview { min-height: 180px; }.media-editor__form { grid-template-columns: 1fr; }.media-editor__form .primary-button { width: 100%; justify-content: center; } }

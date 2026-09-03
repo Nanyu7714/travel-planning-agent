@@ -107,7 +107,8 @@ def generate_chat_reply(messages: list[dict], profile: dict) -> str | None:
 def generate_itinerary_summary(requirement: dict, itinerary: dict) -> str | None:
     system_prompt = (
         "你是旅游行程说明助手。只能根据给定的已校验结构化数据写一段简洁中文交付说明。"
-        "不得增加景点、价格、开放时间、路线距离或交通耗时。必须明确日期与交通仍待确认，费用只包含门票。"
+        "不得增加景点、价格、开放时间、路线距离或交通耗时。必须如实说明出行日期、路线和预算校验状态；"
+        "预算只可称为估算，并明确结构化数据中的未包含项。"
     )
     content = json.dumps({"requirement": requirement, "itinerary": itinerary}, ensure_ascii=False)
     return _call_model(system_prompt, [{"role": "user", "content": content}], max_tokens=300)

@@ -19,6 +19,7 @@ import ItineraryDetailPage from './views/ItineraryDetailPage.vue'
 import ShareItineraryPage from './views/ShareItineraryPage.vue'
 import AdminFeedbackPage from './views/AdminFeedbackPage.vue'
 import AdminMediaAssetsPage from './views/AdminMediaAssetsPage.vue'
+import AdminPhotosPage from './views/AdminPhotosPage.vue'
 import AdminRankingsPage from './views/AdminRankingsPage.vue'
 import AdminAuditLogsPage from './views/AdminAuditLogsPage.vue'
 import CommunityPage from './views/CommunityPage.vue'
@@ -26,6 +27,8 @@ import CommunityDetailPage from './views/CommunityDetailPage.vue'
 import CommunityPublishPage from './views/CommunityPublishPage.vue'
 import AdminCommunityPage from './views/AdminCommunityPage.vue'
 import AdminItinerariesPage from './views/AdminItinerariesPage.vue'
+import AdminKnowledgePage from './views/AdminKnowledgePage.vue'
+import AdminEmailOutboxPage from './views/AdminEmailOutboxPage.vue'
 import AuthActionPage from './views/AuthActionPage.vue'
 
 export default createRouter({
@@ -59,9 +62,12 @@ export default createRouter({
     { path: '/admin/sessions', component: AdminSessionsPage },
     { path: '/admin/feedback', component: AdminFeedbackPage },
     { path: '/admin/media-assets', component: AdminMediaAssetsPage },
+    { path: '/admin/photos', component: AdminPhotosPage },
     { path: '/admin/rankings', component: AdminRankingsPage },
     { path: '/admin/audit-logs', component: AdminAuditLogsPage },
     { path: '/admin/community', component: AdminCommunityPage },
     { path: '/admin/itineraries', component: AdminItinerariesPage },
+    { path: '/admin/knowledge', component: AdminKnowledgePage },
+    { path: '/admin/email-outbox', component: AdminEmailOutboxPage },
   ],
 })

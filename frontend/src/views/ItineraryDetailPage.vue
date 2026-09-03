@@ -3,9 +3,13 @@ import { onMounted, ref } from 'vue'
 import { ArrowDown, ArrowLeft, ArrowUp, Bot, Check, Clock3, Copy, Edit3, Heart, History, Map, Plus, Save, Send, Star, Trash2, X } from 'lucide-vue-next'
 import { useRoute } from 'vue-router'
 import { createShare as createShareApi, getAttractions, getCities, getFavorites, getFeedback, getItinerary, getItineraryAgentRun, getItineraryRevisions, replanItinerary, restoreItineraryRevision, saveFeedback, setFavorite, updateItinerary, type AgentRun, type Attraction, type Itinerary } from '../api'
-const route = useRoute(); const itinerary = ref<Itinerary | null>(null); const draft = ref<Itinerary | null>(null); const attractions = ref<Attraction[]>([]); const agentRun = ref<AgentRun | null>(null); const revisions = ref<{ id:number; version_no:number; reason:string; created_at:string }[]>([]); const feedback = ref<{ rating:number|null; comment:string; average:number|null; count:number }>({ rating:null, comment:'', average:null, count:0 }); const editing = ref(false); const showHistory = ref(false); const saving = ref(false); const instruction = ref(''); const shareUrl = ref(''); const favorite = ref(false); const error = ref(''); const message = ref(''); const rating = ref(0); const comment = ref('')
+const route = useRoute(); const itinerary = ref<Itinerary | null>(null); const draft = ref<Itinerary | null>(null); const attractions = ref<Attraction[]>([]); const agentRun = ref<AgentRun | null>(null); const revisions = ref<{ id:number; version_no:number; reason:string; created_at:string }[]>([]); const feedback = ref<{ rating:number|null; comment:string; average:number|null; count:number; status:'open'|'in_progress'|'resolved'|null; admin_reply:string|null; replied_at:string|null }>({ rating:null, comment:'', average:null, count:0, status:null, admin_reply:null, replied_at:null }); const editing = ref(false); const showHistory = ref(false); const saving = ref(false); const instruction = ref(''); const shareUrl = ref(''); const favorite = ref(false); const error = ref(''); const message = ref(''); const rating = ref(0); const comment = ref('')
 async function load() { try { const id = Number(route.params.id); const [current, currentFeedback, cities, favorites] = await Promise.all([getItinerary(id), getFeedback(id), getCities(), getFavorites()]); itinerary.value = current; draft.value = structuredClone(current); feedback.value = currentFeedback; rating.value = currentFeedback.rating || 0; comment.value = currentFeedback.comment; favorite.value = favorites.some((item) => item.target_type === 'itinerary' && item.target_id === id); const city = cities.find((item) => item.name === current.city_name); attractions.value = city ? await getAttractions(city.id) : []; agentRun.value = await getItineraryAgentRun(id).catch(() => null) } catch (e) { error.value = e instanceof Error ? e.message : '行程加载失败' } }
 function agentStepName(name: string) { return ({ search_attractions: '检索景点资料', select_stops: '筛选候选景点', validate_plan: '校验行程约束' } as Record<string, string>)[name] || name }
+function validationSection(name: string): Record<string, any> { return (itinerary.value?.validation?.[name] || {}) as Record<string, any> }
+function formatDuration(seconds: unknown) { const minutes = Math.max(0, Math.round(Number(seconds || 0) / 60)); return minutes >= 60 ? `${Math.floor(minutes / 60)}小时${minutes % 60}分钟` : `${minutes}分钟` }
+function formatDistance(meters: unknown) { const value = Number(meters || 0); return value >= 1000 ? `${(value / 1000).toFixed(1)}公里` : `${value}米` }
+function transportName(value: unknown) { return ({ public_transport: '公共交通', taxi: '打车', walking: '步行优先', driving: '自驾' } as Record<string, string>)[String(value)] || '未指定' }
 function edit() { if (itinerary.value) { draft.value = structuredClone(itinerary.value); editing.value = true } }
 async function save() { if (!draft.value || !itinerary.value) return; saving.value = true; try { itinerary.value = await updateItinerary(itinerary.value.id, { title: draft.value.title, budget_total: draft.value.budget_total, preferences: draft.value.preferences, expected_version: itinerary.value.lock_version, itinerary_days: draft.value.itinerary_days }); draft.value = structuredClone(itinerary.value); editing.value = false; message.value = '行程已保存' } catch (e) { error.value = e instanceof Error ? e.message : '保存失败' } finally { saving.value = false } }
 function moveStop(day: Itinerary['itinerary_days'][number], index: number, offset: number) { const target = index + offset; if (target < 0 || target >= day.stops.length) return; const item = day.stops[index]; day.stops.splice(index, 1); day.stops.splice(target, 0, item) }
@@ -38,6 +42,35 @@ onMounted(load)
       </header>
       <p v-if="message" class="success-banner"><Check :size="15" />{{ message }}</p>
       <p v-if="error" class="form-error">{{ error }}</p>
+
+      <section class="plan-facts">
+        <div class="section-heading"><div><span class="eyebrow">ROUTE & BUDGET</span><h2>路线与预算</h2></div><Map :size="19" /></div>
+        <p class="fact-message">{{ validationSection('travel').message || '路线数据待生成' }}</p>
+        <div class="fact-grid">
+          <div><span>交通方式</span><strong>{{ transportName(validationSection('travel').transport) }}</strong></div>
+          <div><span>景点间距离</span><strong>{{ formatDistance(validationSection('travel').total_distance_meters) }}</strong></div>
+          <div><span>路线耗时</span><strong>{{ formatDuration(validationSection('travel').total_duration_seconds) }}</strong></div>
+          <div><span>景点间交通</span><strong>¥{{ validationSection('travel').total_cost || 0 }}</strong></div>
+        </div>
+        <div class="intercity-facts">
+          <p><strong>往返跨城</strong><span>{{ validationSection('intercity_travel').message || '未选择出发城市，暂未计算跨城费用' }}</span></p>
+          <div v-if="validationSection('intercity_travel').origin_city" class="fact-grid">
+            <div><span>路线</span><strong>{{ validationSection('intercity_travel').origin_city }} ↔ {{ validationSection('intercity_travel').destination_city }}</strong></div>
+            <div><span>往返距离</span><strong>{{ formatDistance(validationSection('intercity_travel').total_distance_meters) }}</strong></div>
+            <div><span>往返耗时</span><strong>{{ formatDuration(validationSection('intercity_travel').total_duration_seconds) }}</strong></div>
+            <div><span>往返交通</span><strong>¥{{ validationSection('intercity_travel').total_cost || 0 }}</strong></div>
+          </div>
+        </div>
+        <div class="budget-breakdown">
+          <div><span>门票</span><strong>¥{{ validationSection('budget').breakdown?.tickets || 0 }}</strong></div>
+          <div><span>往返跨城</span><strong>¥{{ validationSection('budget').breakdown?.intercity_transport || 0 }}</strong></div>
+          <div><span>餐饮</span><strong>¥{{ validationSection('budget').breakdown?.meals || 0 }}</strong></div>
+          <div><span>住宿</span><strong>¥{{ validationSection('budget').breakdown?.hotel || 0 }}</strong></div>
+          <div><span>完整估算</span><strong>¥{{ validationSection('budget').breakdown?.total ?? itinerary.budget_total }}</strong></div>
+        </div>
+        <p class="scope-note">{{ itinerary.budget_scope }}</p>
+        <p v-if="validationSection('opening_hours').message" class="opening-note">营业时间：{{ validationSection('opening_hours').message }}</p>
+      </section>
 
       <section v-if="editing && draft" class="edit-panel">
         <div class="section-heading"><div><span class="eyebrow">EDIT</span><h2>编辑行程</h2></div><button class="icon-button" title="关闭编辑" aria-label="关闭编辑" @click="editing = false"><X :size="18" /></button></div>
@@ -103,6 +136,7 @@ onMounted(load)
           <strong>{{ rating ? `${rating}/10` : '未评分' }}</strong><small v-if="feedback.average">平均 {{ feedback.average }}/10（{{ feedback.count }} 条）</small>
         </div>
         <textarea v-model="comment" rows="4" placeholder="这份行程哪里最有帮助？"></textarea><button class="primary-button" :disabled="!rating" @click="submitFeedback"><Star :size="16" />提交评分和评论</button>
+        <div v-if="feedback.admin_reply" class="admin-reply"><strong>管理员回复</strong><span v-if="feedback.status === 'resolved'">已解决</span><p>{{ feedback.admin_reply }}</p><small>{{ feedback.replied_at ? new Date(feedback.replied_at).toLocaleString() : '' }}</small></div>
       </section>
       <div v-if="shareUrl" class="share-banner"><Copy :size="16" /><input readonly :value="shareUrl" @focus="($event.target as HTMLInputElement).select()" /></div>
     </template>
@@ -117,6 +151,7 @@ onMounted(load)
 .hero-actions .icon-button.active { color: var(--color-primary); }
 .success-banner, .share-banner { border-radius: var(--radius-control); background: var(--color-surface-soft); color: var(--color-ink); }
 .edit-panel, .history-panel, .replan-panel, .feedback-panel, .agent-trace-panel { border: 1px solid var(--color-border-soft); border-radius: var(--radius-card); background: var(--color-surface); box-shadow: none; }
+.admin-reply{margin-top:18px;padding:14px;border-left:3px solid var(--color-primary);background:var(--color-surface-soft)}.admin-reply strong{font-size:13px}.admin-reply span{margin-left:8px;color:var(--color-primary);font-size:12px}.admin-reply p{margin:8px 0;color:var(--color-body)}.admin-reply small{color:var(--color-muted);font-size:11px}
 .edit-panel label { color: var(--color-muted); }
 .edit-panel input, .edit-panel select, .replan-line input, .feedback-panel textarea { min-height: 48px; padding: 12px; border: 1px solid var(--color-border); border-radius: var(--radius-control); background: var(--color-surface); color: var(--color-ink); }
 .edit-panel input:focus, .edit-panel select:focus, .replan-line input:focus, .feedback-panel textarea:focus { border-color: var(--color-ink); }
@@ -145,4 +180,15 @@ onMounted(load)
 .star-fill { color: var(--color-ink); }
 .share-banner { margin-top: 24px; }
 @media (max-width: 744px) { .itinerary-hero { flex-direction: column; } .hero-actions { width: 100%; justify-content: flex-start; } .hero-actions .secondary-button { flex: 1; } .edit-panel, .history-panel, .replan-panel, .feedback-panel, .agent-trace-panel { border-radius: var(--radius-control); } }
+.plan-facts { max-width: 760px; margin-top: 25px; padding: 22px; border: 1px solid var(--color-border-soft); border-radius: var(--radius-card); background: var(--color-surface); }
+.fact-message, .scope-note, .opening-note { margin: 13px 0 0; color: var(--color-muted); font-size: 13px; line-height: 1.5; }
+.opening-note { color: var(--color-ink); }
+.intercity-facts { margin-top: 18px; }
+.intercity-facts > p { display: grid; gap: 5px; margin: 0; color: var(--color-muted); font-size: 13px; line-height: 1.5; }
+.intercity-facts > p strong { color: var(--color-ink); }
+.fact-grid, .budget-breakdown { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin-top: 18px; border: 1px solid var(--color-border-soft); background: var(--color-border-soft); }
+.fact-grid > div, .budget-breakdown > div { display: grid; gap: 5px; padding: 13px; background: var(--color-surface); }
+.fact-grid span, .budget-breakdown span { color: var(--color-muted); font-size: 11px; }
+.fact-grid strong, .budget-breakdown strong { color: var(--color-ink); font-size: 15px; }
+@media (max-width: 744px) { .plan-facts { border-radius: var(--radius-control); } .fact-grid, .budget-breakdown { grid-template-columns: 1fr 1fr; } }
 </style>

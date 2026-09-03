@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { ArrowUpRight, ClipboardList, Database, Globe2, Image, Landmark, MapPinned, MessageSquareText, Route, Trophy, Users } from 'lucide-vue-next'
+import { ArrowUpRight, BookOpenText, ClipboardList, Database, Globe2, Image, Images, Landmark, MailCheck, MapPinned, MessageSquareText, Route, Trophy, Users } from 'lucide-vue-next'
 import { api } from '../api'
 
-type Overview = { cities: number; attractions: number; users: number; jobs: number; sessions: number; deleted_sessions: number; itineraries?: number; deleted_itineraries?: number; feedback: number; media_assets?: number; community_posts?: number; community_reports?: number }
+type Overview = { cities: number; attractions: number; users: number; jobs: number; sessions: number; deleted_sessions: number; itineraries?: number; deleted_itineraries?: number; feedback: number; email_outbox?: number; failed_email_outbox?: number; media_assets?: number; photos?: number; community_posts?: number; community_reports?: number; knowledge_documents?: number }
 type AgentRuntime = { mode: 'llm' | 'local'; state: string; model: string | null; label: string; last_error: string | null; last_failure_at: string | null; runs: { completed: number; failed: number; running: number } }
 const overview = ref<Overview | null>(null)
 const agentRuntime = ref<AgentRuntime | null>(null)
@@ -11,7 +11,7 @@ const error = ref('')
 onMounted(async () => {
   try {
     const overviewData = await api<Overview>('/admin/overview')
-    overview.value = { ...overviewData, media_assets: overviewData.media_assets ?? 0, itineraries: overviewData.itineraries ?? 0, deleted_itineraries: overviewData.deleted_itineraries ?? 0, community_posts: overviewData.community_posts ?? 0, community_reports: overviewData.community_reports ?? 0 }
+    overview.value = { ...overviewData, email_outbox: overviewData.email_outbox ?? 0, failed_email_outbox: overviewData.failed_email_outbox ?? 0, media_assets: overviewData.media_assets ?? 0, photos: overviewData.photos ?? 0, itineraries: overviewData.itineraries ?? 0, deleted_itineraries: overviewData.deleted_itineraries ?? 0, community_posts: overviewData.community_posts ?? 0, community_reports: overviewData.community_reports ?? 0, knowledge_documents: overviewData.knowledge_documents ?? 0 }
     agentRuntime.value = await api<AgentRuntime>('/admin/agent-status').catch(() => null)
   }
   catch (exception) { error.value = exception instanceof Error ? exception.message : '管理员概览加载失败' }
@@ -27,13 +27,16 @@ onMounted(async () => {
         <RouterLink class="admin-module" to="/admin/cities"><MapPinned :size="24" /><span>城市管理</span><strong>{{ overview.cities }}</strong><small>目的地资料与规划状态</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
         <RouterLink class="admin-module" to="/admin/attractions"><Landmark :size="24" /><span>景点管理</span><strong>{{ overview.attractions }}</strong><small>景点资料、城市与来源</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
         <RouterLink class="admin-module" to="/admin/media-assets"><Image :size="24" /><span>图片管理</span><strong>{{ overview.media_assets }}</strong><small>自动候选、核验与展示状态</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
+        <RouterLink class="admin-module" to="/admin/photos"><Images :size="24" /><span>相片库</span><strong>{{ overview.photos }}</strong><small>自动抓取并保存到本地的相片</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
         <RouterLink class="admin-module" to="/admin/community"><Globe2 :size="24" /><span>社区审核</span><strong>{{ overview.community_posts }}</strong><small>公开帖子，待处理举报 {{ overview.community_reports }}</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
+        <RouterLink class="admin-module" to="/admin/knowledge"><BookOpenText :size="24" /><span>攻略知识库</span><strong>{{ overview.knowledge_documents }}</strong><small>已审核资料，可用于 RAG 检索</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
         <RouterLink class="admin-module" to="/admin/rankings"><Trophy :size="24" /><span>排行管理</span><strong>维护</strong><small>手工排行和批量导入</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
         <RouterLink class="admin-module" to="/admin/audit-logs"><ClipboardList :size="24" /><span>操作审计</span><strong>记录</strong><small>内容维护操作流水</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
         <RouterLink class="admin-module" to="/admin/users"><Users :size="24" /><span>用户管理</span><strong>{{ overview.users }}</strong><small>注册账号与启用状态</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
         <RouterLink class="admin-module" to="/admin/sessions"><MessageSquareText :size="24" /><span>会话管理</span><strong>{{ overview.sessions }}</strong><small>用户已删除 {{ overview.deleted_sessions }} 个，后台保留</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
         <RouterLink class="admin-module" to="/admin/itineraries"><Route :size="24" /><span>行程回收站</span><strong>{{ overview.itineraries }}</strong><small>已删除 {{ overview.deleted_itineraries }} 份，支持恢复</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
         <RouterLink class="admin-module" to="/admin/feedback"><MessageSquareText :size="24" /><span>反馈收件箱</span><strong>{{ overview.feedback }}</strong><small>用户行程评分和评论</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
+        <RouterLink class="admin-module" to="/admin/email-outbox"><MailCheck :size="24" /><span>邮件投递</span><strong>{{ overview.email_outbox }}</strong><small>失败 {{ overview.failed_email_outbox }} 条，记录已脱敏</small><ArrowUpRight class="module-arrow" :size="18" /></RouterLink>
       </div>
       <section class="admin-section"><div class="section-heading"><div><span class="eyebrow">PLATFORM STATUS</span><h2>运行概况</h2></div></div><div class="admin-status-line"><span>累计规划任务</span><strong>{{ overview.jobs }}</strong><small>任务记录可在会话管理中按所属会话查看</small></div></section>
       <section v-if="agentRuntime" class="admin-section agent-runtime">

@@ -1,12 +1,18 @@
-from fastapi.testclient import TestClient
+import os
 import time
+from datetime import datetime, timezone
+
+from fastapi.testclient import TestClient
 
 from app.main import app
+from app.db import SessionLocal
+from app.core.security import hash_password
+from app.models import Itinerary, ItineraryFeedback, User
 from conftest import register_and_login
 
 
 def admin_headers(client: TestClient) -> dict[str, str]:
-    response = client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+    response = client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
     assert response.status_code == 200
     return {"X-CSRF-Token": client.cookies.get("csrf_token")}
 
@@ -91,6 +97,13 @@ def test_linked_content_stays_deactivated_and_admin_mutations_are_audited():
 
         asset = next(item for item in client.get("/api/v1/admin/media-assets", headers=headers).json() if not item["is_active"] and item["url"])
         assert client.patch(f"/api/v1/admin/media-assets/{asset['id']}", json={"alt_text": f"审计测试 {asset['id']}"}, headers=headers).status_code == 200
+        bulk = client.patch(
+            "/api/v1/admin/media-assets/actions/bulk",
+            json={"asset_ids": [asset["id"]], "is_active": False},
+            headers=headers,
+        )
+        assert bulk.status_code == 200
+        assert bulk.json() == {"updated": 1}
 
         suffix = str(time.time_ns())
         username = f"test{suffix}"
@@ -111,3 +124,81 @@ def test_linked_content_stays_deactivated_and_admin_mutations_are_audited():
         assert ("deactivate", "user", account["id"]) in actions
         assert ("restore", "session", session_id) in actions
         assert client.patch(f"/api/v1/admin/attractions/{seeded_attraction['id']}", json={"is_active": True}, headers=headers).status_code == 200
+
+
+def test_admin_can_assign_reply_and_resolve_feedback():
+    suffix = str(time.time_ns())
+    username = f"feedback{suffix}"
+    with TestClient(app) as client:
+        db = SessionLocal()
+        try:
+            account = User(public_id=f"{suffix[-4:]}", username=username, email=f"{username}@example.com", password_hash=hash_password("test123456"), email_verified_at=datetime.now(timezone.utc).replace(tzinfo=None))
+            db.add(account)
+            db.flush()
+            itinerary = Itinerary(user_id=account.id, title="反馈处理测试行程", city_name="成都", days=2, status="saved", budget_total=500)
+            db.add(itinerary)
+            db.flush()
+            feedback = ItineraryFeedback(itinerary_id=itinerary.id, user_id=account.id, rating=6, comment="下午安排过于紧凑")
+            db.add(feedback)
+            db.commit()
+            feedback_id = feedback.id
+            itinerary_id = itinerary.id
+        finally:
+            db.close()
+
+        headers = admin_headers(client)
+        inbox = client.get("/api/v1/admin/feedback?status=open", headers=headers)
+        assert inbox.status_code == 200
+        item = next(item for item in inbox.json()["items"] if item["id"] == feedback_id)
+        assert item["status"] == "open"
+        assignees = client.get("/api/v1/admin/feedback/assignees", headers=headers)
+        assert assignees.status_code == 200
+        admin_id = assignees.json()[0]["id"]
+
+        updated = client.patch(
+            f"/api/v1/admin/feedback/{feedback_id}",
+            json={"status": "resolved", "assigned_admin_id": admin_id, "admin_reply": "已将第二天下午调整为自由活动。"},
+            headers=headers,
+        )
+        assert updated.status_code == 200
+        assert updated.json()["status"] == "resolved"
+        assert updated.json()["assigned_admin_id"] == admin_id
+        assert updated.json()["admin_reply"] == "已将第二天下午调整为自由活动。"
+        assert updated.json()["replied_at"]
+
+        owner_login = client.post("/api/v1/auth/login", json={"account": username, "password": "test123456"})
+        assert owner_login.status_code == 200
+        owner_feedback = client.get(f"/api/v1/itineraries/{itinerary_id}/feedback")
+        assert owner_feedback.status_code == 200
+        assert owner_feedback.json()["status"] == "resolved"
+        assert owner_feedback.json()["admin_reply"] == "已将第二天下午调整为自由活动。"
+
+        headers = admin_headers(client)
+        audit_items = client.get("/api/v1/admin/audit-logs?page=1&page_size=100", headers=headers).json()["items"]
+        assert ("update", "feedback", feedback_id) in {(item["action"], item["target_type"], item["target_id"]) for item in audit_items}
+
+
+def test_approved_guide_knowledge_is_searchable_by_city_only():
+    with TestClient(app) as client:
+        headers = admin_headers(client)
+        city = client.get("/api/v1/cities").json()[0]
+        content = "北京适合把博物馆和老城街巷安排在同一天，步行时留出休息时间。秋天的晴朗下午适合在胡同里慢慢散步，也适合把文化展览与附近的咖啡馆结合起来。出发前应查看场馆官方公告。"
+        created = client.post("/api/v1/admin/knowledge-documents", json={
+            "city_id": city["id"], "title": "北京慢游建议", "source_name": "项目审核资料", "source_url": "https://example.com/beijing-guide", "license_note": "项目自有整理", "content": content,
+        }, headers=headers)
+        assert created.status_code == 201
+        document_id = created.json()["id"]
+        assert created.json()["status"] == "needs_review"
+        assert created.json()["chunk_count"] >= 1
+
+        hidden = client.get(f"/api/v1/guide-knowledge/search?city_id={city['id']}&query=北京慢游胡同", headers=headers)
+        assert hidden.status_code == 200
+        assert hidden.json()["items"] == []
+
+        approved = client.patch(f"/api/v1/admin/knowledge-documents/{document_id}", json={
+            "city_id": city["id"], "title": "北京慢游建议", "source_name": "项目审核资料", "source_url": "https://example.com/beijing-guide", "license_note": "项目自有整理", "content": content, "status": "approved",
+        }, headers=headers)
+        assert approved.status_code == 200
+        hits = client.get(f"/api/v1/guide-knowledge/search?city_id={city['id']}&query=北京慢游胡同", headers=headers)
+        assert hits.status_code == 200
+        assert hits.json()["items"][0]["title"] == "北京慢游建议"

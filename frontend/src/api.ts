@@ -56,7 +56,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
     return fetch(apiUrl(path), { ...options, headers, credentials: 'include' })
   }
   let response = await send()
-  const publicAuthPaths = ['/auth/login', '/auth/register', '/auth/refresh', '/auth/verify-email', '/auth/resend-verification', '/auth/forgot-password', '/auth/reset-password', '/auth/change-email/confirm']
+  const publicAuthPaths = ['/auth/login', '/auth/register', '/auth/refresh', '/auth/verify-email', '/auth/send-verification-code', '/auth/resend-verification', '/auth/forgot-password', '/auth/reset-password', '/auth/change-email/confirm']
   const canRefresh = !publicAuthPaths.includes(path)
   if (response.status === 401 && canRefresh) {
     if (await refreshSession()) response = await send()
@@ -92,10 +92,11 @@ export type MediaAsset = { id: number; city_id: number; attraction_id: number | 
 export type SessionBulkAction = 'archive' | 'restore' | 'delete'
 export type CommunityComment = { id: number; body: string; created_at: string; author: { id: number; name: string }; can_manage: boolean }
 export type CommunityPost = { id: number; title: string; body: string; city_name: string; status: 'published' | 'hidden'; created_at: string; updated_at: string; author: { id: number; name: string }; itinerary: { title: string; city_name: string; days: number; budget_total: number; preferences: string[]; itinerary_days: { day_number: number; title: string; stops: { name: string; start_time: string; end_time: string }[] }[] }; images: { id: number; url: string; alt_text: string }[]; like_count: number; favorite_count: number; comment_count: number; liked: boolean; favorited: boolean; can_manage: boolean; comments?: CommunityComment[] }
-export type AuthAction = { message: string; dev_action_url?: string | null }
+export type AuthAction = { message: string; dev_action_url?: string | null; dev_verification_code?: string | null; masked_email?: string | null; expires_in_seconds?: number | null; retry_after_seconds?: number | null }
 
 export async function getCities() { return api<City[]>('/cities') }
 export async function searchCities(query: string) { return api<City[]>(`/cities/search?q=${encodeURIComponent(query)}`) }
+export async function searchAttractions(query: string) { return api<Attraction[]>(`/attractions/search?q=${encodeURIComponent(query)}`) }
 export async function getAttractions(cityId: number) { return api<Attraction[]>(`/cities/${cityId}/attractions`) }
 export async function getRankings(type = 'city', cityId?: number) {
   const params = new URLSearchParams({ type })
@@ -117,13 +118,26 @@ export async function getItineraryAgentRun(id: number) { return api<AgentRun>(`/
 export async function getAdminMediaAssets(cityId?: number, status?: string) { const params = new URLSearchParams(); if (cityId) params.set('city_id', String(cityId)); if (status) params.set('verification_status', status); return api<MediaAsset[]>(`/admin/media-assets?${params.toString()}`) }
 export async function autofillMediaAsset(id: number) { return api<MediaAsset>(`/admin/media-assets/${id}/autofill`, { method: 'POST', body: '{}' }) }
 export async function updateMediaAsset(id: number, body: Partial<MediaAsset>) { return api<MediaAsset>(`/admin/media-assets/${id}`, { method: 'PATCH', body: JSON.stringify(body) }) }
+export async function uploadMediaAssetFile(id: number, file: File) { const form = new FormData(); form.append('file', file); return api<MediaAsset>(`/admin/media-assets/${id}/upload`, { method: 'POST', body: form }) }
+export type PhotoFetchResult = { keyword: string; fetched: number; skipped: number; providers: string[]; items: MediaAsset[] }
+export type PhotoProviderInfo = { providers: string[]; download_enabled: boolean }
+export async function getAdminPhotos(cityId?: number, attractionId?: number) { const params = new URLSearchParams(); if (cityId) params.set('city_id', String(cityId)); if (attractionId) params.set('attraction_id', String(attractionId)); return api<MediaAsset[]>(`/admin/photos?${params.toString()}`) }
+export async function fetchAdminPhotos(body: { city_id: number; attraction_id?: number | null; keyword: string; limit: number; auto_approve: boolean }) { return api<PhotoFetchResult>('/admin/photos/fetch', { method: 'POST', body: JSON.stringify(body) }) }
+export async function deleteAdminPhoto(id: number) { return api(`/admin/photos/${id}`, { method: 'DELETE', body: '{}' }) }
+export async function usePhotoAsCover(id: number) { return api<MediaAsset>(`/admin/photos/${id}/use-as-cover`, { method: 'POST', body: '{}' }) }
+export async function getPhotoProviders() { return api<PhotoProviderInfo>('/admin/photos/providers') }
 export async function updateItinerary(id: number, body: Record<string, unknown>) { return api<Itinerary>(`/itineraries/${id}`, { method: 'PUT', body: JSON.stringify(body) }) }
 export async function replanItinerary(id: number, instruction: string) { return api<Itinerary>(`/itineraries/${id}/replan`, { method: 'POST', body: JSON.stringify({ instruction }) }) }
 export async function getItineraryRevisions(id: number) { return api<{ id: number; version_no: number; reason: string; created_at: string }[]>(`/itineraries/${id}/revisions`) }
 export async function restoreItineraryRevision(id: number, version: number) { return api<Itinerary>(`/itineraries/${id}/revisions/${version}/restore`, { method: 'POST', body: '{}' }) }
 export async function createShare(id: number, expires_days = 30) { return api<{ id: number; share_url: string; expires_at: string }>(`/itineraries/${id}/shares`, { method: 'POST', body: JSON.stringify({ expires_days }) }) }
 export async function saveFeedback(id: number, rating: number, comment: string) { return api(`/itineraries/${id}/feedback`, { method: 'PUT', body: JSON.stringify({ rating, comment }) }) }
-export async function getFeedback(id: number) { return api<{ rating: number | null; comment: string; average: number | null; count: number }>(`/itineraries/${id}/feedback`) }
+export async function getFeedback(id: number) { return api<{ rating: number | null; comment: string; average: number | null; count: number; status: 'open' | 'in_progress' | 'resolved' | null; admin_reply: string | null; replied_at: string | null }>(`/itineraries/${id}/feedback`) }
+export type AdminFeedback = { id: number; itinerary_id: number; username: string; email: string; city_name: string; itinerary_title: string; rating: number; comment: string; status: 'open' | 'in_progress' | 'resolved'; assigned_admin_id: number | null; assigned_admin_username: string | null; admin_reply: string | null; replied_at: string | null; handled_at: string | null; created_at: string; updated_at: string }
+export type FeedbackAssignee = { id: number; username: string }
+export async function getAdminFeedback(page = 1, status = 'all') { return api<{ items: AdminFeedback[]; total: number; page: number; page_size: number }>(`/admin/feedback?page=${page}&page_size=10&status=${status}`) }
+export async function getFeedbackAssignees() { return api<FeedbackAssignee[]>('/admin/feedback/assignees') }
+export async function updateAdminFeedback(id: number, body: Partial<Pick<AdminFeedback, 'status' | 'assigned_admin_id' | 'admin_reply'>>) { return api<AdminFeedback>(`/admin/feedback/${id}`, { method: 'PATCH', body: JSON.stringify(body) }) }
 export async function getCommunityPosts(city = '', page = 1) { const params = new URLSearchParams({ page: String(page) }); if (city) params.set('city', city); return api<{ items: CommunityPost[]; total: number; page: number; page_size: number }>(`/community/posts?${params.toString()}`) }
 export async function getMyCommunityPosts() { return api<CommunityPost[]>('/community/me/posts') }
 export async function getCommunityPost(id: number) { return api<CommunityPost>(`/community/posts/${id}`) }
@@ -139,8 +153,9 @@ export async function getAuthSessions() { return api<{ id: number; device_name: 
 export async function revokeAuthSession(id: number) { return api(`/auth/sessions/${id}`, { method: 'DELETE' }) }
 export async function changePassword(current_password: string, new_password: string) { return api('/auth/change-password', { method: 'POST', body: JSON.stringify({ current_password, new_password }) }) }
 export async function registerAccount(username: string, email: string, password: string) { return api<AuthAction>('/auth/register', { method: 'POST', body: JSON.stringify({ username, email, password }) }) }
-export async function verifyEmail(token: string) { return api<AuthAction>('/auth/verify-email', { method: 'POST', body: JSON.stringify({ token }) }) }
-export async function resendVerification(email: string) { return api<AuthAction>('/auth/resend-verification', { method: 'POST', body: JSON.stringify({ email }) }) }
+export async function verifyEmail(email: string, code: string) { return api<AuthAction>('/auth/verify-email', { method: 'POST', body: JSON.stringify({ email, code }) }) }
+export async function sendVerificationCode(email: string) { return api<AuthAction>('/auth/send-verification-code', { method: 'POST', body: JSON.stringify({ email }) }) }
+export async function resendVerification(email: string) { return sendVerificationCode(email) }
 export async function forgotPassword(email: string) { return api<AuthAction>('/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email }) }) }
 export async function resetPassword(token: string, new_password: string) { return api('/auth/reset-password', { method: 'POST', body: JSON.stringify({ token, new_password }) }) }
 export async function changeEmail(password: string, email: string) { return api<AuthAction>('/auth/change-email', { method: 'POST', body: JSON.stringify({ password, email }) }) }

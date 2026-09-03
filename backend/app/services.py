@@ -1,17 +1,30 @@
 import asyncio
 import json
+import hashlib
+import math
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.db import SessionLocal
 from app.llm import generate_chat_reply, generate_itinerary_summary
-from app.models import AgentEvent, AgentRun, AgentToolCall, Attraction, ChatMessage, ChatSession, City, Itinerary, ItineraryDay, ItineraryStop, ItineraryValidation, PlanningJob, UserProfile
+from app.maps import parse_coordinate, request_amap_geocode, request_amap_route
+from app.media import search_amap_place
+from app.models import AgentEvent, AgentRun, AgentToolCall, Attraction, ChatMessage, ChatSession, City, IntercityRouteCache, Itinerary, ItineraryDay, ItineraryStop, ItineraryValidation, KnowledgeChunk, KnowledgeDocument, PlanningJob, RetrievalHit, RetrievalRun, RouteCache, UserProfile
 
 
 CITY_NAMES = {"北京": "北京", "上海": "上海", "成都": "成都", "北京市": "北京", "上海市": "上海", "成都市": "成都", "蓉城": "成都"}
+CITY_CODES = {"北京": "010", "上海": "021", "成都": "028"}
+CITY_ROUTE_COORDINATES = {
+    "北京": (39.9042, 116.4074),
+    "上海": (31.2304, 121.4737),
+    "成都": (30.5728, 104.0668),
+}
+MEAL_ESTIMATE_PER_PERSON_DAY = 120
+HOTEL_ESTIMATE_PER_ROOM_NIGHT = 350
+DRIVING_FUEL_ESTIMATE_PER_KM = 0.65
 PROFILE_PREFERENCES = {
     "摄影": ["拍照", "摄影", "街拍", "拍风景"],
     "辣味美食": ["吃辣", "喜欢辣", "爱吃辣", "无辣不欢"],
@@ -24,6 +37,52 @@ PROFILE_PREFERENCES = {
     "轻松慢游": ["慢节奏", "轻松", "悠闲", "慢游"],
     "紧凑打卡": ["紧凑", "特种兵", "多打卡"],
 }
+
+KNOWLEDGE_EMBEDDING_MODEL = "local-hash-v1"
+KNOWLEDGE_DIMENSIONS = 128
+
+
+def split_knowledge_content(content: str, size: int = 420) -> list[str]:
+    text = re.sub(r"\s+", " ", content).strip()
+    return [text[index:index + size] for index in range(0, len(text), size) if text[index:index + size].strip()]
+
+
+def local_embedding(text: str) -> list[float]:
+    vector = [0.0] * KNOWLEDGE_DIMENSIONS
+    normalized = re.sub(r"\s+", "", text.lower())
+    grams = [normalized[index:index + 2] for index in range(max(0, len(normalized) - 1))] or [normalized]
+    for gram in grams:
+        slot = int(hashlib.sha256(gram.encode("utf-8")).hexdigest()[:8], 16) % KNOWLEDGE_DIMENSIONS
+        vector[slot] += 1.0
+    length = math.sqrt(sum(value * value for value in vector))
+    return [round(value / length, 8) for value in vector] if length else vector
+
+
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    return sum(float(a) * float(b) for a, b in zip(left, right))
+
+
+def rebuild_knowledge_chunks(db: Session, document: KnowledgeDocument) -> None:
+    db.query(KnowledgeChunk).filter(KnowledgeChunk.document_id == document.id).delete()
+    for index, chunk in enumerate(split_knowledge_content(document.content)):
+        db.add(KnowledgeChunk(document_id=document.id, chunk_index=index, content=chunk, embedding=local_embedding(chunk), embedding_model=KNOWLEDGE_EMBEDDING_MODEL, token_count=len(chunk)))
+
+
+def search_guide_knowledge(db: Session, city_id: int, query: str, session_id: int | None = None, top_k: int = 3) -> list[dict]:
+    query_vector = local_embedding(query)
+    chunks = list(db.scalars(select(KnowledgeChunk).join(KnowledgeDocument).where(KnowledgeDocument.city_id == city_id, KnowledgeDocument.status == "approved")))
+    ranked = sorted(((chunk, cosine_similarity(query_vector, chunk.embedding or [])) for chunk in chunks), key=lambda item: item[1], reverse=True)
+    hits = [(chunk, score) for chunk, score in ranked[:top_k] if score >= 0.08]
+    run = RetrievalRun(session_id=session_id, query=query[:1000], city_id=city_id, top_k=top_k)
+    db.add(run)
+    db.flush()
+    results = []
+    for rank, (chunk, score) in enumerate(hits, start=1):
+        document = db.get(KnowledgeDocument, chunk.document_id)
+        db.add(RetrievalHit(retrieval_run_id=run.id, chunk_id=chunk.id, rank=rank, score=score))
+        results.append({"content": chunk.content, "title": document.title, "source_name": document.source_name, "source_url": document.source_url, "updated_at": document.updated_at.isoformat(), "score": round(score, 3)})
+    db.flush()
+    return results
 
 
 def is_planning_request(text: str) -> bool:
@@ -145,6 +204,11 @@ def extract_request(text: str, db: Session, previous_user_texts: list[str] | Non
     previous_user_texts = previous_user_texts or []
     city = None
     for candidate_text in [text, *reversed(previous_user_texts)]:
+        destination_match = re.search(r"(?:去|到)\s*(北京|上海|成都)(?:市)?", candidate_text)
+        if destination_match:
+            city = db.scalar(select(City).where(City.name == destination_match.group(1), City.is_active.is_(True)))
+            if city:
+                break
         for raw_name, normalized in CITY_NAMES.items():
             if raw_name in candidate_text:
                 city = db.scalar(select(City).where(City.name == normalized, City.is_active.is_(True)))
@@ -175,6 +239,8 @@ def extract_plan_request(
     saved_avoid_places = saved_avoid_places or []
     city, days, interests = extract_request(text, db, previous_user_texts)
     combined = " ".join([*previous_user_texts, text])
+    origin_match = re.search(r"从\s*(北京|上海|成都)(?:市)?(?:出发|去|到)", combined)
+    origin_city = db.scalar(select(City).where(City.name == origin_match.group(1), City.is_active.is_(True))) if origin_match else None
     preference_interests = [item for item in saved_preferences if item not in ["轻松慢游", "紧凑打卡"]]
     if preference_interests:
         interests = list(dict.fromkeys([*interests, *preference_interests]))
@@ -187,18 +253,20 @@ def extract_plan_request(
     budget_match = re.search(r"预算\s*(?:约|是|为|在|控制在)?\s*[¥￥]?\s*(\d{2,7})", combined)
     traveler_match = re.search(r"(\d{1,2})\s*(?:人|位)", combined)
     return {
+        "origin_city_id": origin_city.id if origin_city else None,
+        "origin": origin_city.name if origin_city else None,
         "destination_city_id": city.id if city else None,
         "destination": city.name if city else None,
         "days": days,
         "budget_total": int(budget_match.group(1)) if budget_match else None,
-        "budget_scope": "门票估算；交通和餐饮未计入",
+        "budget_scope": "将计算门票、景点间市内交通、餐饮和住宿；不含往返目的地交通和购物",
         "interests": interests,
         "avoid_places": list(saved_avoid_places),
         "pace": pace,
         "traveler_count": int(traveler_match.group(1)) if traveler_match else 1,
         "transport": "public_transport",
         "start_date": None,
-        "missing_optional": ["start_date", "route_data", "meal_cost"],
+        "missing_optional": [item for item in ["origin_city_id" if not origin_city else None, "start_date"] if item],
     }
 
 
@@ -206,7 +274,8 @@ def confirmation_message(requirement: dict) -> str:
     pace_name = {"relaxed": "轻松", "balanced": "适中", "packed": "紧凑"}.get(requirement["pace"], "适中")
     budget = f"，预算 ¥{requirement['budget_total']}" if requirement.get("budget_total") else ""
     interests = "、".join(requirement.get("interests") or [])
-    return f"已整理你的旅行需求：{requirement['destination']} {requirement['days']} 天，{requirement['traveler_count']} 人，偏好 {interests}，{pace_name}节奏{budget}。请确认后再生成行程。"
+    origin = f"从{requirement['origin']}出发，" if requirement.get("origin") else ""
+    return f"已整理你的旅行需求：{origin}{requirement['destination']} {requirement['days']} 天，{requirement['traveler_count']} 人，偏好 {interests}，{pace_name}节奏{budget}。确认前请补充出发城市、日期和交通方式；行程会计算往返跨城、景点间交通、门票、餐饮和住宿估算。"
 
 
 def latest_confirmation(db: Session, session_id: int) -> ChatMessage | None:
@@ -295,39 +364,304 @@ def get_attraction_detail(db: Session, attraction_id: int, city_id: int) -> Attr
     return attraction
 
 
-def estimate_budget(attractions: list[Attraction], days: int, people: int, budget: int | None) -> dict:
+def parse_start_date(value: object) -> date | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def opening_window(attraction: Attraction, visit_date: date | None) -> tuple[int, int, str | None]:
+    """Return opening minutes, closing minutes and a validation message for common source formats."""
+    hours = attraction.opening_hours or ""
+    if "全天开放" in hours:
+        return 0, 24 * 60, None
+    closed_weekdays = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+    closed_match = re.search(r"周([一二三四五六日天])闭馆", hours)
+    if visit_date and closed_match and visit_date.weekday() == closed_weekdays[closed_match.group(1)]:
+        return 0, 0, f"{visit_date.isoformat()} 为{closed_match.group(0)}"
+    window_match = re.search(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})", hours)
+    if not window_match:
+        return 9 * 60, 18 * 60, "开放时间格式无法自动校验，需出发前确认"
+    start_hour, start_minute, end_hour, end_minute = (int(item) for item in window_match.groups())
+    return start_hour * 60 + start_minute, end_hour * 60 + end_minute, None
+
+
+def _format_clock(minutes: int) -> str:
+    normalized = max(0, min(minutes, 23 * 60 + 59))
+    return f"{normalized // 60:02d}:{normalized % 60:02d}"
+
+
+def _coordinates(attraction: Attraction) -> tuple[float, float] | None:
+    if attraction.latitude is None or attraction.longitude is None:
+        return None
+    return attraction.latitude, attraction.longitude
+
+
+def ensure_route_coordinates(db: Session, attractions: list[Attraction], city: City) -> tuple[str | None, list[int]]:
+    """Resolve missing attraction coordinates once and persist them for later route requests."""
+    city_code = CITY_CODES.get(city.name)
+    unresolved: list[int] = []
+    for attraction in attractions:
+        if _coordinates(attraction):
+            continue
+        place = search_amap_place(attraction.name, city.name)
+        coordinate = parse_coordinate(place.get("location")) if place else None
+        if not coordinate:
+            unresolved.append(attraction.id)
+            continue
+        attraction.latitude, attraction.longitude = coordinate
+        city_code = city_code or place.get("citycode")
+    db.flush()
+    return city_code, unresolved
+
+
+def _route_cache_key(origin: Attraction, destination: Attraction, transport: str, travel_date: date | None) -> tuple[int, int, str, str]:
+    return origin.id, destination.id, transport, travel_date.isoformat() if transport == "public_transport" and travel_date else ""
+
+
+def route_segment(
+    db: Session,
+    origin: Attraction,
+    destination: Attraction,
+    transport: str,
+    city_code: str | None,
+    travel_date: date | None,
+) -> dict:
+    origin_id, destination_id, mode, service_date = _route_cache_key(origin, destination, transport, travel_date)
+    now = datetime.now()
+    cached = db.scalar(select(RouteCache).where(
+        RouteCache.origin_attraction_id == origin_id,
+        RouteCache.destination_attraction_id == destination_id,
+        RouteCache.transport == mode,
+        RouteCache.service_date == service_date,
+    ))
+    if cached and cached.expires_at > now:
+        return {**cached.route_data, "cached": True}
+    origin_coordinate, destination_coordinate = _coordinates(origin), _coordinates(destination)
+    if not origin_coordinate or not destination_coordinate:
+        return {"status": "unknown", "reason": "景点坐标缺失", "cached": False}
+    route = request_amap_route(
+        origin_coordinate, destination_coordinate, mode, city_code=city_code, travel_date=travel_date,
+    )
+    fallback = None
+    if route is None and mode == "public_transport":
+        route = request_amap_route(
+            origin_coordinate, destination_coordinate, "walking", city_code=city_code, travel_date=travel_date,
+        )
+        fallback = "未找到公共交通方案，改用高德步行路线"
+    if route is None:
+        return {"status": "unknown", "reason": "高德路线服务暂时不可用", "cached": False}
+    if mode == "driving":
+        fuel = round(route["distance_meters"] / 1000 * DRIVING_FUEL_ESTIMATE_PER_KM, 2)
+        route["fuel_estimate"] = fuel
+        route["cost_yuan"] = round(route["cost_yuan"] + fuel, 2)
+        route["cost_source"] = f"{route['cost_source']} + 油费按 ¥{DRIVING_FUEL_ESTIMATE_PER_KM}/公里估算"
+    data = {"status": "passed", **route, "cached": False}
+    if fallback:
+        data["fallback"] = fallback
+    if cached:
+        cached.route_data = {key: value for key, value in data.items() if key != "cached"}
+        cached.expires_at = now + timedelta(hours=24)
+    else:
+        db.add(RouteCache(
+            origin_attraction_id=origin_id,
+            destination_attraction_id=destination_id,
+            transport=mode,
+            service_date=service_date,
+            route_data={key: value for key, value in data.items() if key != "cached"},
+            expires_at=now + timedelta(hours=24),
+        ))
+    db.flush()
+    return data
+
+
+def _with_driving_fuel(route: dict) -> dict:
+    if route.get("transport") != "driving":
+        return route
+    fuel = round(int(route.get("distance_meters", 0)) / 1000 * DRIVING_FUEL_ESTIMATE_PER_KM, 2)
+    return {
+        **route,
+        "fuel_estimate": fuel,
+        "cost_yuan": round(float(route.get("cost_yuan", 0)) + fuel, 2),
+        "cost_source": f"{route.get('cost_source', '道路费用')} + 油费按 ¥{DRIVING_FUEL_ESTIMATE_PER_KM}/公里估算",
+        "cost_basis": "vehicle",
+    }
+
+
+def resolve_city_route_endpoint(city: City) -> dict | None:
+    geocoded = request_amap_geocode(city.name)
+    if geocoded:
+        return {**geocoded, "source": "amap_geocode"}
+    coordinate = CITY_ROUTE_COORDINATES.get(city.name)
+    if coordinate:
+        return {"coordinate": coordinate, "citycode": CITY_CODES.get(city.name), "source": "configured_city_center"}
+    place = search_amap_place(city.name)
+    coordinate = parse_coordinate(place.get("location")) if place else None
+    if coordinate:
+        return {"coordinate": coordinate, "citycode": place.get("citycode"), "source": "amap_poi"}
+    return None
+
+
+def intercity_route(
+    db: Session,
+    origin_city: City | None,
+    destination_city: City,
+    transport: str,
+    travel_date: date | None,
+) -> dict:
+    """Plan one cross-city leg and cache the provider result for 24 hours."""
+    if not origin_city:
+        return {"status": "unknown", "reason": "未选择出发城市"}
+    if origin_city.id == destination_city.id:
+        return {"status": "not_required", "reason": "出发城市与目的地相同"}
+    if transport == "walking":
+        return {"status": "unsupported", "reason": "跨城行程不支持步行方式，请选择公共交通、打车或自驾"}
+    if not travel_date:
+        return {"status": "unknown", "reason": "未填写出发日期"}
+    service_date = travel_date.isoformat()
+    now = datetime.now()
+    cached = db.scalar(select(IntercityRouteCache).where(
+        IntercityRouteCache.origin_city_id == origin_city.id,
+        IntercityRouteCache.destination_city_id == destination_city.id,
+        IntercityRouteCache.transport == transport,
+        IntercityRouteCache.service_date == service_date,
+    ))
+    if cached and cached.expires_at > now:
+        return {**cached.route_data, "cached": True}
+    origin = resolve_city_route_endpoint(origin_city)
+    destination = resolve_city_route_endpoint(destination_city)
+    if not origin or not destination:
+        return {"status": "unknown", "reason": "无法解析出发城市或目的地坐标"}
+    route = request_amap_route(
+        origin["coordinate"], destination["coordinate"], transport,
+        city_code=origin.get("citycode") or CITY_CODES.get(origin_city.name),
+        destination_city_code=destination.get("citycode") or CITY_CODES.get(destination_city.name),
+        travel_date=travel_date,
+    )
+    if not route:
+        return {"status": "unknown", "reason": "高德未返回跨城路线"}
+    data = {
+        "status": "passed", "from_city": origin_city.name, "to_city": destination_city.name,
+        "origin_coordinate_source": origin["source"], "destination_coordinate_source": destination["source"],
+        **_with_driving_fuel(route), "cached": False,
+    }
+    if cached:
+        cached.route_data = {key: value for key, value in data.items() if key != "cached"}
+        cached.expires_at = now + timedelta(hours=24)
+    else:
+        db.add(IntercityRouteCache(
+            origin_city_id=origin_city.id, destination_city_id=destination_city.id,
+            transport=transport, service_date=service_date,
+            route_data={key: value for key, value in data.items() if key != "cached"},
+            expires_at=now + timedelta(hours=24),
+        ))
+    db.flush()
+    return data
+
+
+def route_cost_for_group(route: dict, people: int) -> float:
+    amount = float(route.get("cost_yuan", 0))
+    cost_basis = route.get("cost_basis") or ("per_person" if route.get("transport") == "public_transport" else "vehicle")
+    return round(amount * people if cost_basis == "per_person" else amount, 2)
+
+
+def order_day_attractions(attractions: list[Attraction]) -> list[Attraction]:
+    """Keep the first ranked stop, then choose the nearest available stop by straight-line distance."""
+    if len(attractions) < 3 or not all(_coordinates(item) for item in attractions):
+        return attractions
+    remaining = list(attractions[1:])
+    ordered = [attractions[0]]
+    while remaining:
+        previous = _coordinates(ordered[-1])
+        assert previous is not None
+        next_item = min(remaining, key=lambda item: (previous[0] - _coordinates(item)[0]) ** 2 + (previous[1] - _coordinates(item)[1]) ** 2)
+        ordered.append(next_item)
+        remaining.remove(next_item)
+    return ordered
+
+
+def schedule_day(
+    db: Session,
+    attractions: list[Attraction],
+    day_number: int,
+    visit_date: date | None,
+    transport: str,
+    city_code: str | None,
+) -> tuple[list[dict], list[dict], list[str]]:
+    cursor = 9 * 60
+    previous: Attraction | None = None
+    scheduled: list[dict] = []
+    segments: list[dict] = []
+    opening_issues: list[str] = []
+    for attraction in order_day_attractions(attractions):
+        route = None
+        if previous:
+            route = route_segment(db, previous, attraction, transport, city_code, visit_date)
+            segments.append({"from": previous.name, "to": attraction.name, **route})
+            if route["status"] == "passed":
+                cursor += max(1, (int(route["duration_seconds"]) + 59) // 60)
+        opens_at, closes_at, opening_issue = opening_window(attraction, visit_date)
+        if closes_at == 0:
+            opening_issues.append(f"{attraction.name}：{opening_issue}")
+        elif opening_issue:
+            opening_issues.append(f"{attraction.name}：{opening_issue}")
+        cursor = max(cursor, opens_at)
+        end = cursor + attraction.duration_minutes
+        if closes_at and end > closes_at:
+            opening_issues.append(f"{attraction.name}：预计 {_format_clock(end)} 结束，晚于 {attraction.opening_hours}")
+        note = f"{attraction.area} · 建议游览{attraction.duration_minutes}分钟 · 开放时间{attraction.opening_hours}"
+        if route and route["status"] == "passed":
+            note += f" · 距上一站 {route['distance_meters'] / 1000:.1f}公里，约 {max(1, round(route['duration_seconds'] / 60))}分钟"
+        elif route:
+            note += " · 上一站路线待确认"
+        scheduled.append({"attraction": attraction, "start_time": _format_clock(cursor), "end_time": _format_clock(end), "note": note})
+        cursor = end
+        previous = attraction
+    return scheduled, segments, opening_issues
+
+
+def estimate_budget(
+    attractions: list[Attraction],
+    days: int,
+    people: int,
+    requested_budget: int | None,
+    segments: list[dict],
+    intercity_routes: list[dict] | None = None,
+) -> dict:
     ticket_estimate = sum(item.ticket_price for item in attractions) * people
+    transport_estimate = round(sum(route_cost_for_group(segment, people) for segment in segments if segment.get("status") == "passed"), 2)
+    intercity_routes = intercity_routes or []
+    intercity_transport_estimate = round(sum(route_cost_for_group(route, people) for route in intercity_routes if route.get("status") == "passed"), 2)
+    routed_distance = sum(int(segment.get("distance_meters", 0)) for segment in segments if segment.get("status") == "passed")
+    meal_estimate = MEAL_ESTIMATE_PER_PERSON_DAY * people * days
+    hotel_rooms = max(1, (people + 1) // 2)
+    hotel_estimate = HOTEL_ESTIMATE_PER_ROOM_NIGHT * hotel_rooms * max(0, days - 1)
+    total_estimate = round(ticket_estimate + transport_estimate + intercity_transport_estimate + meal_estimate + hotel_estimate, 2)
+    intercity_complete = bool(intercity_routes) and all(route.get("status") in {"passed", "not_required"} for route in intercity_routes)
     return {
-        "ticket_estimate": ticket_estimate, "days": days, "people": people,
-        "requested_budget": budget, "within_budget": budget is None or ticket_estimate <= budget,
-        "scope": ["tickets"],
-    }
-
-
-def calculate_route_or_area_order(stops: list[Attraction]) -> tuple[list[Attraction], dict]:
-    """Transparent area grouping until a real route provider is introduced."""
-    ordered = sorted(stops, key=lambda item: ((item.area or "未分区"), item.id))
-    return ordered, {
-        "strategy": "area_grouping", "ordered_stop_ids": [item.id for item in ordered],
-        "areas": [item.area for item in ordered],
-    }
-
-
-def validate_schedule(stops: list[Attraction], day_selections: list[list[Attraction]], city_id: int, required_count: int) -> dict:
-    overlong_days = []
-    for number, day_stops in enumerate(day_selections, start=1):
-        duration = sum(item.duration_minutes for item in day_stops) + max(0, len(day_stops) - 1) * 45
-        if duration > 600:
-            overlong_days.append(number)
-    invalid_city_ids = [item.id for item in stops if item.city_id != city_id]
-    return {
-        "opening_hours": {"status": "unknown", "message": "缺少出行日期和可解析的营业日规则，需在出发前确认。"},
-        "daily_load": {
-            "status": "failed" if overlong_days else ("passed" if len(stops) >= required_count else "partial"),
-            "message": "单日游览时长未超过 10 小时。" if not overlong_days else f"第 {','.join(map(str, overlong_days))} 天超过 10 小时。",
+        "ticket_estimate": ticket_estimate,
+        "local_transport_estimate": transport_estimate,
+        "intercity_transport_estimate": intercity_transport_estimate,
+        "meal_estimate": meal_estimate,
+        "hotel_estimate": hotel_estimate,
+        "total_estimate": total_estimate,
+        "days": days,
+        "people": people,
+        "hotel_rooms": hotel_rooms,
+        "requested_budget": requested_budget,
+        "within_budget": requested_budget is None or total_estimate <= requested_budget,
+        "routed_distance_meters": routed_distance,
+        "scope": ["tickets", "local_transport_between_attractions", "meals", "hotel", *( ["intercity_round_trip"] if intercity_complete else [] )],
+        "not_included": [*( ["intercity_transport"] if not intercity_complete else [] ), "shopping"],
+        "assumptions": {
+            "meal_per_person_day": MEAL_ESTIMATE_PER_PERSON_DAY,
+            "hotel_per_room_night": HOTEL_ESTIMATE_PER_ROOM_NIGHT,
+            "hotel_occupancy": "2人/间",
+            "driving_fuel_per_km": DRIVING_FUEL_ESTIMATE_PER_KM,
         },
-        "city": {"status": "passed" if not invalid_city_ids else "failed", "invalid_stop_ids": invalid_city_ids},
-        "travel": {"status": "partial", "message": "已按区域排序；未接入真实交通路由，路程时间和费用不计入。"},
     }
 
 
@@ -362,12 +696,12 @@ def build_itinerary(db: Session, job: PlanningJob, requirement: dict, agent_run:
     traveler_count = max(1, int(requirement.get("traveler_count", 1)))
     requested_budget = requirement.get("budget_total")
     initial_selected = [item for item, _ in ranked[:required_count]]
-    initial_budget = estimate_budget(initial_selected, days, traveler_count, requested_budget)
+    initial_ticket_estimate = sum(item.ticket_price for item in initial_selected) * traveler_count
     selected, repaired_for_budget = select_with_budget(ranked, required_count, traveler_count, requested_budget)
     repair_attempts = 1 if repaired_for_budget else 0
     if agent_run and repaired_for_budget:
         record_tool_call(db, agent_run, "repair_plan", {
-            "attempt": repair_attempts, "max_attempts": 2, "failed_constraint": "budget", "before": initial_budget,
+            "attempt": repair_attempts, "max_attempts": 2, "failed_constraint": "ticket_budget", "before_ticket_estimate": initial_ticket_estimate,
         }, {
             "strategy": "keep_cheapest_relevant_stops", "after_stop_ids": [item.id for item in selected],
         })
@@ -378,23 +712,64 @@ def build_itinerary(db: Session, job: PlanningJob, requirement: dict, agent_run:
             "selected_count": len(selected), "selected": [_attraction_data(item) for item in selected],
             "budget_repair_applied": repaired_for_budget,
         })
-    _emit_agent_stage(db, job, "planning", "正在整理景点详情并安排同区域路线")
+    _emit_agent_stage(db, job, "planning", "正在补齐景点坐标并调用高德规划路线")
     if agent_run:
         for attraction in selected:
             detail = get_attraction_detail(db, attraction.id, city.id)
             record_tool_call(db, agent_run, "get_attraction_detail", {"attraction_id": attraction.id}, _attraction_data(detail))
-    budget = estimate_budget(selected, days, traveler_count, requested_budget)
-    selected, route = calculate_route_or_area_order(selected)
+    start_date = parse_start_date(requirement.get("start_date"))
+    transport = requirement.get("transport") or "public_transport"
+    origin_city = db.get(City, requirement.get("origin_city_id")) if requirement.get("origin_city_id") else None
+    intercity_routes: list[dict] = []
+    if origin_city and origin_city.id == city.id:
+        intercity_routes.append({"status": "not_required", "reason": "出发城市与目的地相同", "from_city": city.name, "to_city": city.name})
+    elif origin_city:
+        intercity_routes = [
+            intercity_route(db, origin_city, city, transport, start_date),
+            intercity_route(db, city, origin_city, transport, start_date + timedelta(days=days - 1) if start_date else None),
+        ]
+    else:
+        intercity_routes.append({"status": "unknown", "reason": "未选择出发城市"})
     if agent_run:
-        record_tool_call(db, agent_run, "estimate_budget", {"attraction_ids": [item.id for item in selected], "days": days, "people": traveler_count}, budget)
-        record_tool_call(db, agent_run, "calculate_route_or_area_order", {"stop_ids": [item.id for item in selected]}, route)
+        record_tool_call(db, agent_run, "calculate_intercity_routes", {
+            "origin_city": origin_city.name if origin_city else None,
+            "destination_city": city.name,
+            "transport": transport,
+            "outbound_date": start_date.isoformat() if start_date else None,
+            "return_date": (start_date + timedelta(days=days - 1)).isoformat() if start_date else None,
+        }, {"routes": intercity_routes})
+    city_code, unresolved_attraction_ids = ensure_route_coordinates(db, selected, city)
+    if agent_run:
+        record_tool_call(db, agent_run, "resolve_attraction_coordinates", {
+            "city": city.name, "attraction_ids": [item.id for item in selected],
+        }, {
+            "city_code": city_code, "unresolved_attraction_ids": unresolved_attraction_ids,
+            "resolved_count": len(selected) - len(unresolved_attraction_ids),
+        })
     day_selections: list[list[Attraction]] = [[] for _ in range(days)]
     per_day = max(1, (len(selected) + days - 1) // days)
     for index, attraction in enumerate(selected):
         day_selections[min(index // per_day, days - 1)].append(attraction)
-    _emit_agent_stage(db, job, "checking", "正在校验时间、预算和城市归属")
-    schedule_validation = validate_schedule(selected, day_selections, city.id, required_count)
-    ticket_estimate = budget["ticket_estimate"]
+    day_plans: list[list[dict]] = []
+    segments: list[dict] = []
+    opening_issues: list[str] = []
+    for day_number, day_attractions in enumerate(day_selections, start=1):
+        visit_date = start_date + timedelta(days=day_number - 1) if start_date else None
+        scheduled, day_segments, day_opening_issues = schedule_day(
+            db, day_attractions, day_number, visit_date, transport, city_code,
+        )
+        day_plans.append(scheduled)
+        segments.extend(day_segments)
+        opening_issues.extend(day_opening_issues)
+    budget = estimate_budget(selected, days, traveler_count, requested_budget, segments, intercity_routes)
+    if agent_run:
+        record_tool_call(db, agent_run, "calculate_amap_routes", {
+            "transport": transport, "start_date": start_date.isoformat() if start_date else None,
+        }, {"segments": segments, "unresolved_attraction_ids": unresolved_attraction_ids})
+        record_tool_call(db, agent_run, "estimate_budget", {
+            "attraction_ids": [item.id for item in selected], "days": days, "people": traveler_count,
+        }, budget)
+    _emit_agent_stage(db, job, "checking", "正在校验营业时间、路线耗时和完整预算")
     _emit_agent_stage(db, job, "saving", "正在保存可执行行程")
     itinerary = Itinerary(
         user_id=db.scalar(select(ChatSession.user_id).where(ChatSession.id == job.session_id)),
@@ -402,53 +777,105 @@ def build_itinerary(db: Session, job: PlanningJob, requirement: dict, agent_run:
         title=f"{city.name}{days}日个性行程",
         city_name=city.name,
         days=days,
-        budget_total=ticket_estimate,
-        budget_scope="仅门票估算；交通和餐饮未计入",
+        budget_total=round(budget["total_estimate"]),
+        budget_scope=(
+            "往返跨城交通、门票、景点间市内交通、餐饮和住宿估算；不含购物"
+            if "intercity_round_trip" in budget["scope"] else
+            "门票、景点间市内交通、餐饮和住宿估算；未覆盖跨城交通和购物"
+        ),
         preferences=list(requirement.get("interests") or []),
     )
     db.add(itinerary)
     db.flush()
     for day_number in range(1, days + 1):
-        day_attractions = day_selections[day_number - 1]
+        day_attractions = day_plans[day_number - 1]
         day_title = f"第{day_number}天 · {city.name}探索" if day_attractions else f"第{day_number}天 · 自由安排"
         day = ItineraryDay(itinerary_id=itinerary.id, day_number=day_number, title=day_title)
         db.add(day)
         db.flush()
-        cursor = datetime(2000, 1, 1, 9, 0)
-        for attraction in day_attractions:
-            end = cursor + timedelta(minutes=attraction.duration_minutes)
+        for scheduled in day_attractions:
+            attraction = scheduled["attraction"]
             db.add(ItineraryStop(
                 day_id=day.id,
                 attraction_id=attraction.id,
                 name=attraction.name,
-                start_time=cursor.strftime("%H:%M"),
-                end_time=end.strftime("%H:%M"),
-                note=f"{attraction.area} · 建议游览{attraction.duration_minutes}分钟 · 开放时间{attraction.opening_hours}",
+                start_time=scheduled["start_time"],
+                end_time=scheduled["end_time"],
+                note=scheduled["note"],
             ))
-            cursor = end + timedelta(minutes=45)
+    route_successes = [segment for segment in segments if segment.get("status") == "passed"]
+    route_failures = [segment for segment in segments if segment.get("status") != "passed"]
+    travel_status = "passed" if segments and not route_failures else "partial"
+    intercity_successes = [route for route in intercity_routes if route.get("status") == "passed"]
+    intercity_status = "passed" if intercity_routes and all(route.get("status") in {"passed", "not_required"} for route in intercity_routes) else "partial"
+    intercity_date_fallback = any(route.get("schedule_date_fallback") for route in intercity_successes)
+    opening_failures = [issue for issue in opening_issues if "闭馆" in issue or "晚于" in issue]
+    opening_status = "failed" if opening_failures else ("partial" if not start_date or opening_issues else "passed")
+    daily_durations: list[int] = []
+    for stops in day_plans:
+        if stops:
+            first = stops[0]["start_time"].split(":")
+            last = stops[-1]["end_time"].split(":")
+            daily_durations.append((int(last[0]) * 60 + int(last[1])) - (int(first[0]) * 60 + int(first[1])))
+    budget_status = "over_budget" if requested_budget is not None and not budget["within_budget"] else ("passed" if requested_budget is not None else "partial")
     validation = {
-        "algorithm_version": "rules-v0.2",
-        "opening_hours": {"status": "unknown", "message": "日期未定，常规开放时间已展示，特殊日期需出发前复核"},
-        "travel": {"status": "unknown", "message": "缺少可靠路线数据，交通耗时和费用未计入"},
+        "algorithm_version": "amap-route-v2",
+        "travel_start_date": start_date.isoformat() if start_date else None,
+        "opening_hours": {
+            "status": opening_status,
+            "message": "已按出行日期校验营业时间" if opening_status == "passed" else (
+                "存在闭馆或超出营业时间的安排：" + "；".join(opening_failures) if opening_failures else
+                "未填写出行日期或部分开放时间无法自动解析，需出发前确认"
+            ),
+            "issues": opening_issues,
+        },
+        "travel": {
+            "status": travel_status,
+            "provider": "高德地图",
+            "transport": transport,
+            "message": f"已获取 {len(route_successes)} 段景点间路线" if travel_status == "passed" else "部分路线缺失或当天仅有一个景点，未计入的路段需确认",
+            "total_distance_meters": budget["routed_distance_meters"],
+            "total_duration_seconds": sum(int(segment.get("duration_seconds", 0)) for segment in route_successes),
+            "total_cost": budget["local_transport_estimate"],
+            "segments": segments,
+            "unresolved_attraction_ids": unresolved_attraction_ids,
+        },
+        "intercity_travel": {
+            "status": intercity_status,
+            "provider": "高德地图",
+            "transport": transport,
+            "origin_city": origin_city.name if origin_city else None,
+            "destination_city": city.name,
+            "message": (
+                "指定日期未返回跨城公共交通方案，已使用高德通用公共交通路线估算，车次需出发前确认"
+                if intercity_status == "passed" and intercity_date_fallback else
+                "已获取往返跨城路线" if intercity_status == "passed" else "跨城路线未完整获取，未返回费用不会计入预算"
+            ),
+            "total_distance_meters": sum(int(route.get("distance_meters", 0)) for route in intercity_successes),
+            "total_duration_seconds": sum(int(route.get("duration_seconds", 0)) for route in intercity_successes),
+            "total_cost": budget["intercity_transport_estimate"],
+            "routes": intercity_routes,
+        },
         "daily_load": {
-            "status": "passed" if len(selected) >= required_count else "partial",
-            "message": "每天安排 2 个主要景点，游览时长不超过 10 小时" if len(selected) >= required_count else f"资料库当前有 {len(selected)} 个符合条件的景点，已均匀安排到 {days} 天；未填满的时段保留为自由安排",
+            "status": "passed" if len(selected) >= required_count and all(duration <= 600 for duration in daily_durations) else "partial",
+            "message": "每日安排已结合实际路线耗时，单日不超过 10 小时" if daily_durations and all(duration <= 600 for duration in daily_durations) else "部分日期未排满或安排时长超过建议范围，保留为自由安排",
+            "durations_minutes": daily_durations,
         },
         "budget": {
-            "status": "over_budget" if requested_budget is not None and ticket_estimate > int(requested_budget) else "partial",
-            "message": f"门票估算 ¥{ticket_estimate}，超过填写预算 ¥{requested_budget}" if requested_budget is not None and ticket_estimate > int(requested_budget) else "仅计入门票费用",
-            "included": ["tickets"],
-            "not_included": ["local_transport", "meals", "hotel", "intercity_transport", "shopping"],
-        },
-    }
-    validation = {
-        "algorithm_version": "tool-agent-v2",
-        **schedule_validation,
-        "budget": {
-            "status": "passed" if requested_budget is not None and budget["within_budget"] else "partial",
-            "message": f"门票估算 ¥{ticket_estimate}，在填写预算内。" if requested_budget is not None and budget["within_budget"] else "仅计入门票费用。",
-            "included": ["tickets"],
-            "not_included": ["local_transport", "meals", "hotel", "intercity_transport", "shopping"],
+            "status": budget_status,
+            "message": (
+                f"完整预算估算 ¥{budget['total_estimate']}，在填写预算 ¥{requested_budget} 内。" if budget_status == "passed" else
+                f"完整预算估算 ¥{budget['total_estimate']}，超过填写预算 ¥{requested_budget}。" if budget_status == "over_budget" else
+                f"完整预算估算 ¥{budget['total_estimate']}；未填写总预算，无法判断是否超支。"
+            ),
+            "included": budget["scope"],
+            "not_included": budget["not_included"],
+            "breakdown": {
+                "tickets": budget["ticket_estimate"], "local_transport": budget["local_transport_estimate"],
+                "intercity_transport": budget["intercity_transport_estimate"], "meals": budget["meal_estimate"],
+                "hotel": budget["hotel_estimate"], "total": budget["total_estimate"],
+            },
+            "assumptions": budget["assumptions"],
         },
         "interest_match": {
             "status": "passed" if any(score > 0 for _, score in ranked[:len(selected)]) else "partial",
@@ -460,24 +887,27 @@ def build_itinerary(db: Session, job: PlanningJob, requirement: dict, agent_run:
     if agent_run:
         record_tool_call(db, agent_run, "validate_schedule", {
             "stop_ids": [item.id for item in selected], "opening_hours": [item.opening_hours for item in selected],
-            "duration_limit_minutes": 600,
-        }, schedule_validation)
+            "start_date": start_date.isoformat() if start_date else None, "duration_limit_minutes": 600,
+        }, {"opening_hours": validation["opening_hours"], "daily_load": validation["daily_load"]})
         record_tool_call(db, agent_run, "validate_plan", {
             "itinerary_id": itinerary.id, "selected_count": len(selected), "days": days,
         }, {
             "daily_load": validation["daily_load"], "budget": validation["budget"],
             "opening_hours": validation["opening_hours"], "travel": validation["travel"],
+            "intercity_travel": validation["intercity_travel"],
         })
         record_tool_call(db, agent_run, "save_itinerary_draft", {
             "city": city.name, "days": days, "stop_ids": [item.id for item in selected],
         }, {"itinerary_id": itinerary.id})
         agent_run.itinerary_id = itinerary.id
         agent_run.status = "completed"
-        agent_run.algorithm_version = "tool-agent-v2"
+        agent_run.algorithm_version = "amap-route-v2"
         agent_run.summary = {
             "selected_count": len(selected), "requested_stop_count": required_count,
             "budget_repair_applied": repaired_for_budget, "repair_attempts": repair_attempts,
-            "ticket_estimate": ticket_estimate,
+            "budget_total_estimate": budget["total_estimate"],
+            "routed_segment_count": len(route_successes),
+            "intercity_routed_segment_count": len(intercity_successes),
         }
     db.commit()
     return itinerary
@@ -525,7 +955,7 @@ def _process_plan_job(db: Session, job: PlanningJob) -> None:
         emit(db, job.session_id, "done", {"turn_id": str(job.id), "status": "cancelled"})
         return
     response = generate_itinerary_summary(requirement, itinerary_dict(db, itinerary.id) or {}) or (
-        f"已经生成 {requirement['destination']}{requirement['days']}日行程。常规开放时间已展示；日期、交通和未计入费用仍需确认。"
+        f"已经生成 {requirement['destination']}{requirement['days']}日行程。已按所选交通方式计算景点间路线，并纳入门票、餐饮和住宿估算；往返目的地交通和购物未计入。"
     )
     payload = {
         "type": "itinerary",

@@ -1,3 +1,5 @@
+import os
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -6,6 +8,21 @@ from app.main import app
 def test_health():
     with TestClient(app) as client:
         assert client.get("/api/v1/health/live").json() == {"status": "ok"}
+
+
+def test_public_search_finds_cities_and_attractions():
+    with TestClient(app) as client:
+        cities = client.get("/api/v1/cities").json()
+        city = cities[0]
+        attractions = client.get(f"/api/v1/cities/{city['id']}/attractions").json()
+
+        city_results = client.get("/api/v1/cities/search", params={"q": city["name"]}).json()
+        attraction_results = client.get("/api/v1/attractions/search", params={"q": attractions[0]["name"]}).json()
+        city_attraction_results = client.get("/api/v1/attractions/search", params={"q": city["name"]}).json()
+
+        assert city_results[0]["id"] == city["id"]
+        assert attractions[0]["id"] in {item["id"] for item in attraction_results}
+        assert {item["city_id"] for item in city_attraction_results} == {city["id"]}
 
 
 def test_attraction_rankings_are_filtered_by_city():
@@ -65,9 +82,9 @@ def test_admin_can_autofill_review_and_activate_attraction_image(monkeypatch):
         "license_name": "CC BY-SA 4.0",
         "attribution_url": "https://commons.wikimedia.org/wiki/File:Example.jpg",
     }
-    monkeypatch.setattr("app.main.search_commons_image", lambda _: candidate)
+    monkeypatch.setattr("app.main.collect_photo_candidates", lambda *_args, **_kwargs: [candidate])
     with TestClient(app) as client:
-        login = client.post("/api/v1/auth/login", json={"account": "admin", "password": "123456"})
+        login = client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
         assert login.status_code == 200
         headers = {"X-CSRF-Token": client.cookies.get("csrf_token")}
         assets = client.get("/api/v1/admin/media-assets").json()

@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     app_base_url: str = "http://localhost:5173"
     jwt_secret: str = "dev-jwt-secret-change-me"
     csrf_secret: str = "dev-csrf-secret-change-me"
+    admin_initial_password: str | None = None
     access_token_minutes: int = 15
     refresh_token_days: int = 7
     environment: str = "development"
@@ -20,6 +21,7 @@ class Settings(BaseSettings):
     smtp_password: str | None = None
     smtp_starttls: bool = True
     auth_email_token_minutes: int = 30
+    email_verification_code_minutes: int = 3
     password_reset_token_minutes: int = 30
     inline_worker: bool = True
     llm_api_key: str | None = None
@@ -28,6 +30,11 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 30.0
     llm_max_tokens: int = 500
     amap_web_service_key: str | None = None
+    # Optional free-stock photo providers. Leave empty to use Wikimedia Commons only.
+    unsplash_access_key: str | None = None
+    pexels_api_key: str | None = None
+    # When true, fetched photos are downloaded into backend/media instead of only storing remote URLs.
+    photo_download_enabled: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

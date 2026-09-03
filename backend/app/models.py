@@ -65,6 +65,26 @@ class AuthActionToken(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class EmailOutbox(Base):
+    __tablename__ = "email_outbox"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'sent', 'failed', 'simulated')"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True)
+    purpose: Mapped[str] = mapped_column(String(30), index=True)
+    recipient_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    recipient_masked: Mapped[str] = mapped_column(String(255))
+    subject: Mapped[str] = mapped_column(String(180))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error_code: Mapped[str | None] = mapped_column(String(80))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class AuthRateLimitBucket(Base):
     __tablename__ = "auth_rate_limit_buckets"
     __table_args__ = (UniqueConstraint("action", "scope_type", "scope_hash"),)
@@ -271,8 +291,59 @@ class ItineraryFeedback(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     rating: Mapped[int] = mapped_column(Integer)
     comment: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="open", index=True)
+    assigned_admin_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True)
+    admin_reply: Mapped[str | None] = mapped_column(Text)
+    replied_at: Mapped[datetime | None] = mapped_column(DateTime)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id"), index=True)
+    title: Mapped[str] = mapped_column(String(160))
+    source_name: Mapped[str] = mapped_column(String(160))
+    source_url: Mapped[str | None] = mapped_column(String(1000))
+    license_note: Mapped[str | None] = mapped_column(String(500))
+    content: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="needs_review", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class KnowledgeChunk(Base):
+    __tablename__ = "knowledge_chunks"
+    __table_args__ = (UniqueConstraint("document_id", "chunk_index"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("knowledge_documents.id"), index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    content: Mapped[str] = mapped_column(Text)
+    embedding: Mapped[list] = mapped_column(JSON)
+    embedding_model: Mapped[str] = mapped_column(String(80), default="local-hash-v1")
+    token_count: Mapped[int] = mapped_column(Integer)
+
+
+class RetrievalRun(Base):
+    __tablename__ = "retrieval_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int | None] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
+    query: Mapped[str] = mapped_column(String(1000))
+    city_id: Mapped[int] = mapped_column(ForeignKey("cities.id"), index=True)
+    top_k: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class RetrievalHit(Base):
+    __tablename__ = "retrieval_hits"
+    __table_args__ = (UniqueConstraint("retrieval_run_id", "chunk_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    retrieval_run_id: Mapped[int] = mapped_column(ForeignKey("retrieval_runs.id"), index=True)
+    chunk_id: Mapped[int] = mapped_column(ForeignKey("knowledge_chunks.id"), index=True)
+    rank: Mapped[int] = mapped_column(Integer)
+    score: Mapped[float] = mapped_column()
 
 
 class ItineraryValidation(Base):
@@ -281,6 +352,34 @@ class ItineraryValidation(Base):
     itinerary_id: Mapped[int] = mapped_column(ForeignKey("itineraries.id"), unique=True, index=True)
     data: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class RouteCache(Base):
+    __tablename__ = "route_cache"
+    __table_args__ = (UniqueConstraint("origin_attraction_id", "destination_attraction_id", "transport", "service_date"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    origin_attraction_id: Mapped[int] = mapped_column(ForeignKey("attractions.id"), index=True)
+    destination_attraction_id: Mapped[int] = mapped_column(ForeignKey("attractions.id"), index=True)
+    transport: Mapped[str] = mapped_column(String(30))
+    service_date: Mapped[str] = mapped_column(String(10), default="")
+    route_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class IntercityRouteCache(Base):
+    __tablename__ = "intercity_route_cache"
+    __table_args__ = (UniqueConstraint("origin_city_id", "destination_city_id", "transport", "service_date"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    origin_city_id: Mapped[int] = mapped_column(ForeignKey("cities.id"), index=True)
+    destination_city_id: Mapped[int] = mapped_column(ForeignKey("cities.id"), index=True)
+    transport: Mapped[str] = mapped_column(String(30))
+    service_date: Mapped[str] = mapped_column(String(10))
+    route_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class ItineraryDay(Base):
