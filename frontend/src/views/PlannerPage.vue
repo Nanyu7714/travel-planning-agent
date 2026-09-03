@@ -60,6 +60,11 @@ const bulkNeedsPassword = computed(() => bulkAction.value === 'delete' && bulkTa
 const activeSessionKey = 'travel-planner-active-session'
 const eventCursorKey = (id: number) => `travel-planner-event-${id}`
 
+function newIdempotencyKey() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`
+}
+
 function blankRequirement(): PlanDraft {
   return { origin_city_id: null, destination_city_id: null, destination: '', days: 3, traveler_count: 1, start_date: new Date().toISOString().slice(0, 10), budget_total: null, interests: '', avoid_places: '', pace: 'balanced', transport: 'public_transport' }
 }
@@ -245,7 +250,7 @@ async function sendMessage() {
   const content = input.value.trim(); if (!content || sending.value) return
   messages.value.push({ role: 'user', content }); input.value = ''; sending.value = true; stage.value = '正在处理你的消息'
   try {
-    const id = await ensureSession(); const job = await api<{ job_id: number; session_title: string }>(`/sessions/${id}/messages`, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ content }) }); jobId.value = job.job_id
+    const id = await ensureSession(); const job = await api<{ job_id: number; session_title: string }>(`/sessions/${id}/messages`, { method: 'POST', headers: { 'Idempotency-Key': newIdempotencyKey() }, body: JSON.stringify({ content }) }); jobId.value = job.job_id
     const activeSession = sessions.value.find((session) => session.id === id)
     if (activeSession) activeSession.title = job.session_title
     await connectEvents(id)
@@ -286,7 +291,7 @@ async function confirmPlan(payload?: MessagePayload) {
   try {
     const job = await api<{ job_id: number }>(`/sessions/${sessionId.value}/plan-confirm`, {
       method: 'POST',
-      headers: { 'Idempotency-Key': crypto.randomUUID() },
+      headers: { 'Idempotency-Key': newIdempotencyKey() },
       body: JSON.stringify({ confirmed: true, patch: {
         origin_city_id: requirementDraft.value.origin_city_id,
         destination_city_id: requirementDraft.value.destination_city_id,
