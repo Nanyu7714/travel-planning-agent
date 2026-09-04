@@ -16,6 +16,7 @@ import RankingsPage from './views/RankingsPage.vue'
 import UserHomePage from './views/UserHomePage.vue'
 import SecuritySettingsPage from './views/SecuritySettingsPage.vue'
 import ItineraryDetailPage from './views/ItineraryDetailPage.vue'
+import MySharesPage from './views/MySharesPage.vue'
 import ShareItineraryPage from './views/ShareItineraryPage.vue'
 import AdminFeedbackPage from './views/AdminFeedbackPage.vue'
 import AdminMediaAssetsPage from './views/AdminMediaAssetsPage.vue'
@@ -52,6 +53,7 @@ export default createRouter({
     { path: '/cities/:slug', component: CityDetailPage },
     { path: '/attractions/:id', component: AttractionDetailPage },
     { path: '/me', component: UserHomePage },
+    { path: '/me/shares', component: MySharesPage },
     { path: '/me/settings/profile', component: ProfileSettingsPage },
     { path: '/me/settings/security', component: SecuritySettingsPage },
     { path: '/share/itineraries/:token', component: ShareItineraryPage },

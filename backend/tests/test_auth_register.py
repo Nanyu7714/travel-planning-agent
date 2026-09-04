@@ -24,7 +24,7 @@ def test_register_requires_email_verification_before_login():
         assert response.status_code == 202
         assert response.json()["masked_email"].endswith("@example.com")
         assert response.json()["retry_after_seconds"] == 0
-        assert response.json()["dev_verification_code"] is None
+        assert "dev_verification_code" not in response.json()
         assert f"{username}@example.com" not in response.json()["message"]
         assert client.get("/api/v1/auth/me").status_code == 401
         assert client.post("/api/v1/auth/login", json={"account": username, "password": password}).status_code == 403
@@ -48,6 +48,25 @@ def test_register_requires_email_verification_before_login():
         assert login.json()["email_verified"] is True
         assert len(login.json()["public_id"]) == 4
         assert login.json()["public_id"].isdigit()
+
+
+def test_unverified_registration_is_not_visible_in_admin_user_list():
+    suffix = uuid.uuid4().hex
+    username = f"pending{suffix}"
+    with TestClient(app) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"username": username, "email": f"{username}@example.com", "password": "test123456"},
+        )
+        assert registered.status_code == 202
+        assert client.post(
+            "/api/v1/auth/login",
+            json={"account": "admin", "password": ADMIN_INITIAL_PASSWORD},
+        ).status_code == 200
+        users = client.get(f"/api/v1/admin/users?search={username}&page=1&page_size=10")
+        assert users.status_code == 200
+        assert users.json()["total"] == 0
+        assert users.json()["items"] == []
 
 
 def test_auth_email_html_uses_code_panel_and_safe_action_button():
@@ -135,9 +154,25 @@ def test_verification_code_cannot_be_resent_during_cooldown():
         repeated = client.post("/api/v1/auth/send-verification-code", json={"email": payload["email"]})
         assert repeated.status_code == 202
         assert 1 <= repeated.json()["retry_after_seconds"] <= 60
-        assert repeated.json()["dev_verification_code"] is None
+        assert "dev_verification_code" not in repeated.json()
         with SessionLocal() as db:
             assert db.scalar(select(AuthActionToken.id).order_by(AuthActionToken.id.desc())) == first_token_id
+
+
+def test_verification_resend_cooldown_is_capped_at_sixty_seconds():
+    suffix = uuid.uuid4().hex
+    payload = {"username": f"test{suffix}", "email": f"test{suffix}@example.com", "password": "test123456"}
+    with TestClient(app) as client:
+        assert client.post("/api/v1/auth/register", json=payload).status_code == 202
+        assert client.post("/api/v1/auth/send-verification-code", json={"email": payload["email"]}).status_code == 202
+        with SessionLocal() as db:
+            record = db.scalar(select(AuthActionToken).order_by(AuthActionToken.id.desc()))
+            assert record is not None
+            record.created_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=8)
+            db.commit()
+        repeated = client.post("/api/v1/auth/send-verification-code", json={"email": payload["email"]})
+        assert repeated.status_code == 202
+        assert repeated.json()["retry_after_seconds"] == 60
 
 
 def test_pending_username_cannot_be_changed_with_wrong_password():

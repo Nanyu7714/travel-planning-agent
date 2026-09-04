@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.db import SessionLocal
 from app.llm import generate_chat_reply, generate_itinerary_summary
-from app.maps import parse_coordinate, request_amap_geocode, request_amap_route
+from app.maps import parse_coordinate, request_amap_geocode, request_amap_nearby_food, request_amap_route, request_amap_weather
 from app.media import search_amap_place
 from app.models import AgentEvent, AgentRun, AgentToolCall, Attraction, ChatMessage, ChatSession, City, IntercityRouteCache, Itinerary, ItineraryDay, ItineraryStop, ItineraryValidation, KnowledgeChunk, KnowledgeDocument, PlanningJob, RetrievalHit, RetrievalRun, RouteCache, UserProfile
 
@@ -252,12 +252,14 @@ def extract_plan_request(
         pace = "packed"
     budget_match = re.search(r"预算\s*(?:约|是|为|在|控制在)?\s*[¥￥]?\s*(\d{2,7})", combined)
     traveler_match = re.search(r"(\d{1,2})\s*(?:人|位)", combined)
+    attraction_count_match = re.search(r"(\d+)\s*(?:个|处|家)\s*(?:景点|旅游景点|地方)", combined)
     return {
         "origin_city_id": origin_city.id if origin_city else None,
         "origin": origin_city.name if origin_city else None,
         "destination_city_id": city.id if city else None,
         "destination": city.name if city else None,
         "days": days,
+        "attraction_count": max(1, min(int(attraction_count_match.group(1)), 12)) if attraction_count_match else 3,
         "budget_total": int(budget_match.group(1)) if budget_match else None,
         "budget_scope": "将计算门票、景点间市内交通、餐饮和住宿；不含往返目的地交通和购物",
         "interests": interests,
@@ -275,7 +277,8 @@ def confirmation_message(requirement: dict) -> str:
     budget = f"，预算 ¥{requirement['budget_total']}" if requirement.get("budget_total") else ""
     interests = "、".join(requirement.get("interests") or [])
     origin = f"从{requirement['origin']}出发，" if requirement.get("origin") else ""
-    return f"已整理你的旅行需求：{origin}{requirement['destination']} {requirement['days']} 天，{requirement['traveler_count']} 人，偏好 {interests}，{pace_name}节奏{budget}。确认前请补充出发城市、日期和交通方式；行程会计算往返跨城、景点间交通、门票、餐饮和住宿估算。"
+    attraction_count = requirement.get("attraction_count", 3)
+    return f"已整理你的旅行需求：{origin}{requirement['destination']} {requirement['days']} 天，安排 {attraction_count} 个景点，{requirement['traveler_count']} 人，偏好 {interests}，{pace_name}节奏{budget}。确认前请补充出发城市、日期和交通方式；行程会先查计划日期天气，再查询景点坐标、驾车路线和附近美食。"
 
 
 def latest_confirmation(db: Session, session_id: int) -> ChatMessage | None:
@@ -401,19 +404,23 @@ def _coordinates(attraction: Attraction) -> tuple[float, float] | None:
 
 
 def ensure_route_coordinates(db: Session, attractions: list[Attraction], city: City) -> tuple[str | None, list[int]]:
-    """Resolve missing attraction coordinates once and persist them for later route requests."""
+    """Resolve each attraction's text address before any route tool receives coordinates."""
     city_code = CITY_CODES.get(city.name)
     unresolved: list[int] = []
     for attraction in attractions:
         if _coordinates(attraction):
             continue
-        place = search_amap_place(attraction.name, city.name)
-        coordinate = parse_coordinate(place.get("location")) if place else None
+        geocoded = request_amap_geocode(f"{city.name}{attraction.name}")
+        coordinate = geocoded.get("coordinate") if geocoded else None
+        place = None
+        if not coordinate:
+            place = search_amap_place(attraction.name, city.name)
+            coordinate = parse_coordinate(place.get("location")) if place else None
         if not coordinate:
             unresolved.append(attraction.id)
             continue
         attraction.latitude, attraction.longitude = coordinate
-        city_code = city_code or place.get("citycode")
+        city_code = city_code or (geocoded or {}).get("citycode") or (place or {}).get("citycode")
     db.flush()
     return city_code, unresolved
 
@@ -681,9 +688,13 @@ def build_itinerary(db: Session, job: PlanningJob, requirement: dict, agent_run:
     interests = requirement.get("interests") or ["文化", "美食"]
     interest_tags = expanded_interest_tags(interests)
     avoid_places = requirement.get("avoid_places") or []
+    start_date = parse_start_date(requirement.get("start_date"))
+    weather = request_amap_weather(CITY_CODES.get(city.name), start_date)
+    if agent_run:
+        record_tool_call(db, agent_run, "query_weather", {"city": city.name, "travel_date": start_date.isoformat() if start_date else None}, weather)
     _emit_agent_stage(db, job, "retrieving", "正在查询景点资料")
     ranked = search_attractions(db, city, interest_tags, avoid_places)
-    required_count = days * 2
+    required_count = max(1, min(int(requirement.get("attraction_count", 3)), 12))
     if not ranked:
         raise ValueError(f"{city.name}当前没有符合排除条件的可用景点，请调整不想去的地方后重试")
     if agent_run:
@@ -717,7 +728,6 @@ def build_itinerary(db: Session, job: PlanningJob, requirement: dict, agent_run:
         for attraction in selected:
             detail = get_attraction_detail(db, attraction.id, city.id)
             record_tool_call(db, agent_run, "get_attraction_detail", {"attraction_id": attraction.id}, _attraction_data(detail))
-    start_date = parse_start_date(requirement.get("start_date"))
     transport = requirement.get("transport") or "public_transport"
     origin_city = db.get(City, requirement.get("origin_city_id")) if requirement.get("origin_city_id") else None
     intercity_routes: list[dict] = []
@@ -746,6 +756,24 @@ def build_itinerary(db: Session, job: PlanningJob, requirement: dict, agent_run:
             "city_code": city_code, "unresolved_attraction_ids": unresolved_attraction_ids,
             "resolved_count": len(selected) - len(unresolved_attraction_ids),
         })
+    navigation_stops = order_day_attractions(selected)
+    driving_segments = [
+        {"from": origin.name, "to": destination.name, **route_segment(db, origin, destination, "driving", city_code, start_date)}
+        for origin, destination in zip(navigation_stops, navigation_stops[1:])
+    ]
+    nearby_food = [
+        {"attraction_id": attraction.id, "attraction_name": attraction.name, "items": request_amap_nearby_food(_coordinates(attraction), city.name, limit=2)}
+        for attraction in navigation_stops
+        if _coordinates(attraction)
+    ]
+    if agent_run:
+        record_tool_call(db, agent_run, "calculate_driving_navigation", {
+            "ordered_attraction_ids": [item.id for item in navigation_stops],
+            "coordinate_ready": not unresolved_attraction_ids,
+        }, {"segments": driving_segments})
+        record_tool_call(db, agent_run, "search_nearby_food", {
+            "attraction_ids": [item.id for item in navigation_stops], "radius_meters": 1500,
+        }, {"recommendations": nearby_food})
     day_selections: list[list[Attraction]] = [[] for _ in range(days)]
     per_day = max(1, (len(selected) + days - 1) // days)
     for index, attraction in enumerate(selected):
@@ -829,6 +857,13 @@ def build_itinerary(db: Session, job: PlanningJob, requirement: dict, agent_run:
             ),
             "issues": opening_issues,
         },
+        "weather": weather,
+        "driving_navigation": {
+            "status": "passed" if driving_segments and all(segment.get("status") == "passed" for segment in driving_segments) else "partial",
+            "message": "已按景点文字地址转坐标后生成驾车导航路线" if driving_segments else "景点数量不足 2 个，未生成驾车导航路线",
+            "segments": driving_segments,
+        },
+        "nearby_food": nearby_food,
         "travel": {
             "status": travel_status,
             "provider": "高德地图",
@@ -908,6 +943,9 @@ def build_itinerary(db: Session, job: PlanningJob, requirement: dict, agent_run:
             "budget_total_estimate": budget["total_estimate"],
             "routed_segment_count": len(route_successes),
             "intercity_routed_segment_count": len(intercity_successes),
+            "weather_status": weather.get("status"),
+            "driving_navigation_segment_count": len(driving_segments),
+            "nearby_food_count": sum(len(group["items"]) for group in nearby_food),
         }
     db.commit()
     return itinerary

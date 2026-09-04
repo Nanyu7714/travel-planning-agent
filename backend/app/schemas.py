@@ -68,7 +68,6 @@ class PasswordResetIn(AuthTokenIn):
 class AuthActionOut(BaseModel):
     message: str
     dev_action_url: str | None = None
-    dev_verification_code: str | None = None
     masked_email: str | None = None
     expires_in_seconds: int | None = None
     retry_after_seconds: int | None = None
@@ -424,6 +423,7 @@ class PlanRequirementPatchIn(BaseModel):
     origin_city_id: int | None = Field(default=None, ge=1)
     destination_city_id: int | None = Field(default=None, ge=1)
     days: int | None = Field(default=None, ge=2, le=5)
+    attraction_count: int | None = Field(default=None, ge=1, le=12)
     start_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     budget_total: int | None = Field(default=None, ge=0, le=10_000_000)
     interests: list[str] | None = Field(default=None, max_length=20)
@@ -490,15 +490,24 @@ class ItineraryRevisionOut(BaseModel):
 
 
 class ReplanActionIn(BaseModel):
-    type: Literal["set_budget", "set_days", "remove_attraction", "replace_attraction"]
+    type: Literal["set_budget", "set_days", "set_preferences", "remove_attraction", "replace_attraction"]
     value: int | None = Field(default=None, ge=0, le=100000)
     attraction_id: int | None = Field(default=None, ge=1)
     new_attraction_id: int | None = Field(default=None, ge=1)
+    preferences: list[str] | None = Field(default=None, max_length=20)
 
 
 class ReplanIn(BaseModel):
     instruction: str = Field(default="", max_length=1000)
     actions: list[ReplanActionIn] = Field(default_factory=list, max_length=20)
+
+
+class ReplanPreviewOut(BaseModel):
+    status: Literal["ready", "needs_clarification"]
+    summary: str
+    actions: list[ReplanActionIn] = Field(default_factory=list)
+    questions: list[str] = Field(default_factory=list)
+    parser: Literal["llm", "local"]
 
 
 class ShareCreateIn(BaseModel):
@@ -509,6 +518,17 @@ class ShareOut(BaseModel):
     id: int
     share_url: str
     expires_at: datetime
+    created_at: datetime
+
+
+class ShareHistoryOut(BaseModel):
+    id: int
+    itinerary_id: int
+    itinerary_title: str
+    city_name: str
+    status: Literal["active", "expired", "revoked"]
+    expires_at: datetime
+    revoked_at: datetime | None
     created_at: datetime
 
 

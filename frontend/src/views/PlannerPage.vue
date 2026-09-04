@@ -14,6 +14,7 @@ type MessagePayload = {
   origin_city_id?: number
   origin?: string
   days?: number
+  attraction_count?: number
   traveler_count?: number
   interests?: string[]
   avoid_places?: string[]
@@ -26,7 +27,7 @@ type MessagePayload = {
 type Message = { id?: number; role: string; content: string; payload?: MessagePayload }
 type ServerEvent = { event_id: number | null; session_id: string; turn_id: string | null; type: string; payload: Record<string, unknown> }
 type AgentStatus = { mode: 'llm' | 'local'; state: 'disabled' | 'configured' | 'connected' | 'degraded'; model: string | null; label: string }
-type PlanDraft = { origin_city_id: number | null; destination_city_id: number | null; destination: string; days: number; traveler_count: number; start_date: string; budget_total: number | null; interests: string; avoid_places: string; pace: 'relaxed' | 'balanced' | 'packed'; transport: 'public_transport' | 'taxi' | 'walking' | 'driving' }
+type PlanDraft = { origin_city_id: number | null; destination_city_id: number | null; destination: string; days: number; attraction_count: number; traveler_count: number; start_date: string; budget_total: number | null; interests: string; avoid_places: string; pace: 'relaxed' | 'balanced' | 'packed'; transport: 'public_transport' | 'taxi' | 'walking' | 'driving' }
 const router = useRouter()
 const messages = ref<Message[]>([{ role: 'assistant', content: '你好，我是行旅规划助手。我们可以先聊聊你的旅行喜好；需要规划时告诉我，我会收集完整需求并请你确认。' }])
 const input = ref('')
@@ -66,7 +67,7 @@ function newIdempotencyKey() {
 }
 
 function blankRequirement(): PlanDraft {
-  return { origin_city_id: null, destination_city_id: null, destination: '', days: 3, traveler_count: 1, start_date: new Date().toISOString().slice(0, 10), budget_total: null, interests: '', avoid_places: '', pace: 'balanced', transport: 'public_transport' }
+  return { origin_city_id: null, destination_city_id: null, destination: '', days: 3, attraction_count: 3, traveler_count: 1, start_date: new Date().toISOString().slice(0, 10), budget_total: null, interests: '', avoid_places: '', pace: 'balanced', transport: 'public_transport' }
 }
 
 function splitList(value: string) {
@@ -263,6 +264,7 @@ function applyRequirement(payload: MessagePayload) {
     origin_city_id: payload.origin_city_id || cities.value.find((city) => city.name === payload.origin)?.id || null,
     destination: payload.destination || matchedCity?.name || '',
     days: payload.days || 3,
+    attraction_count: payload.attraction_count || 3,
     traveler_count: payload.traveler_count || 1,
     start_date: payload.start_date || new Date().toISOString().slice(0, 10),
     budget_total: payload.budget_total ?? null,
@@ -296,6 +298,7 @@ async function confirmPlan(payload?: MessagePayload) {
         origin_city_id: requirementDraft.value.origin_city_id,
         destination_city_id: requirementDraft.value.destination_city_id,
         days: Number(requirementDraft.value.days),
+        attraction_count: Number(requirementDraft.value.attraction_count),
         traveler_count: Number(requirementDraft.value.traveler_count),
         start_date: requirementDraft.value.start_date,
         budget_total: requirementDraft.value.budget_total,
@@ -464,7 +467,8 @@ onBeforeUnmount(() => { eventSource?.close(); eventSource = null })
         <form class="brief-form" @submit.prevent="confirmPlan(pendingConfirmation || undefined)">
           <label>目的地<select v-model.number="requirementDraft.destination_city_id" :disabled="briefLocked"><option :value="null" disabled>待确定</option><option v-for="city in cities" :key="city.id" :value="city.id" :disabled="!city.planning_enabled">{{ city.name }}</option></select></label>
           <label>出发城市<select v-model.number="requirementDraft.origin_city_id" :disabled="briefLocked"><option :value="null" disabled>请选择出发城市</option><option v-for="city in cities" :key="city.id" :value="city.id">{{ city.name }}</option></select></label>
-          <div class="brief-pair"><label>天数<input v-model.number="requirementDraft.days" type="number" min="2" max="5" :disabled="briefLocked" /></label><label>人数<input v-model.number="requirementDraft.traveler_count" type="number" min="1" max="20" :disabled="briefLocked" /></label></div>
+          <div class="brief-pair"><label>天数<input v-model.number="requirementDraft.days" type="number" min="2" max="5" :disabled="briefLocked" /></label><label>景点数量<input v-model.number="requirementDraft.attraction_count" type="number" min="1" max="12" :disabled="briefLocked" /></label></div>
+          <label>人数<input v-model.number="requirementDraft.traveler_count" type="number" min="1" max="20" :disabled="briefLocked" /></label>
           <label>出发日期<input v-model="requirementDraft.start_date" type="date" :disabled="briefLocked" /></label>
           <label>预算<input :value="requirementDraft.budget_total ?? ''" type="number" min="0" placeholder="待补充" :disabled="briefLocked" @input="requirementDraft.budget_total = ($event.target as HTMLInputElement).value ? Number(($event.target as HTMLInputElement).value) : null" /></label>
           <label>兴趣偏好<input v-model="requirementDraft.interests" placeholder="例如：摄影、美食" :disabled="briefLocked" /></label>
@@ -477,7 +481,7 @@ onBeforeUnmount(() => { eventSource?.close(); eventSource = null })
       </aside>
     </div>
 
-    <div v-if="bulkAction" class="bulk-dialog-backdrop" role="presentation" @click.self="closeBulkAction">
+    <div v-if="bulkAction" class="bulk-dialog-backdrop" role="presentation" @click.self="() => closeBulkAction()">
       <form class="bulk-dialog" role="dialog" aria-modal="true" :aria-labelledby="'bulk-dialog-title'" @submit.prevent="confirmBulkAction">
         <span class="eyebrow">CONFIRM ACTION</span>
         <h2 id="bulk-dialog-title">确认{{ bulkActionLabel }} {{ bulkTargetIds.length }} 条对话？</h2>
@@ -487,7 +491,7 @@ onBeforeUnmount(() => { eventSource?.close(); eventSource = null })
         <label v-if="bulkNeedsPassword">当前账号密码<input v-model="bulkPassword" type="password" autocomplete="current-password" required placeholder="请输入密码确认批量删除" /></label>
         <p v-if="bulkError" class="bulk-error" role="alert">{{ bulkError }}</p>
         <div class="bulk-dialog-actions">
-          <button class="secondary-button" type="button" :disabled="bulkSubmitting" @click="closeBulkAction">取消</button>
+          <button class="secondary-button" type="button" :disabled="bulkSubmitting" @click="() => closeBulkAction()">取消</button>
           <button :class="bulkAction === 'delete' ? 'danger-button' : 'primary-button'" type="submit" :disabled="bulkSubmitting">{{ bulkSubmitting ? '正在处理' : `确认${bulkActionLabel}` }}</button>
         </div>
       </form>

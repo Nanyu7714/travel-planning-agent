@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import hmac
 import json
@@ -11,35 +12,32 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete, func, inspect, or_, select, text, update
+from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.security import create_access_token, decode_access_token, hash_password, new_csrf_token, new_refresh_token, password_needs_rehash, token_hash, verify_password
-from app.db import Base, SessionLocal, engine, get_db
-from app.llm import get_llm_status
+from app.db import SessionLocal, engine, get_db
+from app.llm import generate_replan_interpretation, get_llm_status
 from app.mail import AuthMail, MailDeliveryError, action_email_html, send_auth_mail, verification_email_html
 from app.media import collect_photo_candidates, download_image, sanitize_image_bytes, search_amap_place, search_commons_image
+from app.modules.system.router import router as system_router
 from app.models import AdminAuditLog, AgentEvent, AgentRun, AgentToolCall, Attraction, AuthActionToken, AuthRateLimitBucket, AuthSession, ChatMessage, ChatSession, City, CommunityComment, CommunityPost, CommunityPostFavorite, CommunityPostImage, CommunityPostLike, ContentReport, EmailOutbox, Favorite, IdempotencyRecord, Itinerary, ItineraryDay, ItineraryFeedback, ItineraryRevision, ItineraryStop, ItineraryValidation, KnowledgeChunk, KnowledgeDocument, MediaAsset, PlanningJob, RankingEntry, RecentView, ShareLink, User, UserProfile
-from app.schemas import AccountDeleteIn, AdminAttractionCreateIn, AdminAttractionImportIn, AdminAttractionOut, AdminAttractionUpdateIn, AdminAuditLogOut, AdminAuditLogPageOut, AdminCityCreateIn, AdminCityImportIn, AdminCityOut, AdminCityUpdateIn, AdminEmailOutboxOut, AdminEmailOutboxPageOut, AdminFeedbackOut, AdminFeedbackPageOut, AdminFeedbackUpdateIn, AdminItineraryOut, AdminItineraryPageOut, AdminKnowledgeDocumentOut, AdminPhotoFetchIn, AdminPhotoFetchOut, AdminRankingCreateIn, AdminRankingImportIn, AdminRankingOut, AdminRankingUpdateIn, AdminSessionOut, AdminSessionPageOut, AdminUserOut, AdminUserPageOut, AdminUserUpdateIn, AttractionOut, AuthActionOut, AuthSessionOut, AuthTokenIn, CityOut, CommunityCommentCreateIn, CommunityPostCreateIn, CommunityPostUpdateIn, CommunityStatusUpdateIn, ContentReportCreateIn, ContentReportStatusUpdateIn, EmailChangeIn, EmailRequestIn, EmailVerificationIn, FeedbackIn, FeedbackOut, ItineraryRevisionOut, ItineraryUpdateIn, KnowledgeDocumentIn, KnowledgeDocumentUpdateIn, LoginIn, MediaAssetBulkUpdateIn, MediaAssetOut, MediaAssetUpdateIn, MessageIn, MessageOut, PasswordChangeIn, PasswordResetIn, PlanConfirmIn, RegisterIn, ReplanIn, SessionBulkUpdateIn, SessionOut, SessionUpdateIn, ShareCreateIn, ShareOut, UserOut, UserProfileOut, UserProfileUpdateIn
+from app.schemas import AccountDeleteIn, AdminAttractionCreateIn, AdminAttractionImportIn, AdminAttractionOut, AdminAttractionUpdateIn, AdminAuditLogOut, AdminAuditLogPageOut, AdminCityCreateIn, AdminCityImportIn, AdminCityOut, AdminCityUpdateIn, AdminEmailOutboxOut, AdminEmailOutboxPageOut, AdminFeedbackOut, AdminFeedbackPageOut, AdminFeedbackUpdateIn, AdminItineraryOut, AdminItineraryPageOut, AdminKnowledgeDocumentOut, AdminPhotoFetchIn, AdminPhotoFetchOut, AdminRankingCreateIn, AdminRankingImportIn, AdminRankingOut, AdminRankingUpdateIn, AdminSessionOut, AdminSessionPageOut, AdminUserOut, AdminUserPageOut, AdminUserUpdateIn, AttractionOut, AuthActionOut, AuthSessionOut, AuthTokenIn, CityOut, CommunityCommentCreateIn, CommunityPostCreateIn, CommunityPostUpdateIn, CommunityStatusUpdateIn, ContentReportCreateIn, ContentReportStatusUpdateIn, EmailChangeIn, EmailRequestIn, EmailVerificationIn, FeedbackIn, FeedbackOut, ItineraryRevisionOut, ItineraryUpdateIn, KnowledgeDocumentIn, KnowledgeDocumentUpdateIn, LoginIn, MediaAssetBulkUpdateIn, MediaAssetOut, MediaAssetUpdateIn, MessageIn, MessageOut, PasswordChangeIn, PasswordResetIn, PlanConfirmIn, RegisterIn, ReplanActionIn, ReplanIn, ReplanPreviewOut, SessionBulkUpdateIn, SessionOut, SessionUpdateIn, ShareCreateIn, ShareHistoryOut, ShareOut, UserOut, UserProfileOut, UserProfileUpdateIn
 from app.services import CITY_NAMES, confirmation_message, itinerary_dict, latest_confirmation, process_job_async, rebuild_knowledge_chunks, search_guide_knowledge
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    ensure_user_identity_columns()
-    ensure_auth_security_columns()
-    ensure_user_profile_columns()
-    ensure_itinerary_columns()
-    ensure_session_management_columns()
-    ensure_content_status_columns()
-    ensure_feedback_workflow_columns()
+    ensure_database_migrated()
     seed_database()
     backfill_user_public_ids()
     backfill_session_titles()
@@ -48,53 +46,19 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="行旅旅游规划 Agent", version="0.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=[settings.app_base_url], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.include_router(system_router, prefix="/api/v1")
 MEDIA_ROOT = Path(__file__).resolve().parent.parent / "media"
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=MEDIA_ROOT), name="media")
 logger = logging.getLogger(__name__)
 
 
-def ensure_user_identity_columns() -> None:
-    columns = {column["name"] for column in inspect(engine).get_columns("users")}
-    timestamp_type = "TIMESTAMP" if engine.dialect.name == "postgresql" else "DATETIME"
-    with engine.begin() as connection:
-        if "public_id" not in columns:
-            connection.execute(text("ALTER TABLE users ADD COLUMN public_id VARCHAR(4)"))
-        if "deleted_at" not in columns:
-            connection.execute(text(f"ALTER TABLE users ADD COLUMN deleted_at {timestamp_type}"))
-        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_public_id ON users (public_id)"))
-
-
-def ensure_auth_security_columns() -> None:
-    """Mark pre-existing accounts verified once when upgrading a development database."""
-    columns = {column["name"] for column in inspect(engine).get_columns("users")}
-    if "email_verified_at" in columns:
-        return
-    timestamp_type = "TIMESTAMP" if engine.dialect.name == "postgresql" else "DATETIME"
-    with engine.begin() as connection:
-        connection.execute(text(f"ALTER TABLE users ADD COLUMN email_verified_at {timestamp_type}"))
-        connection.execute(text("UPDATE users SET email_verified_at = created_at WHERE email_verified_at IS NULL"))
-        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_users_email_verified_at ON users (email_verified_at)"))
-
-
-def ensure_user_profile_columns() -> None:
-    columns = {column["name"] for column in inspect(engine).get_columns("user_profiles")}
-    with engine.begin() as connection:
-        if "avoid_places" not in columns:
-            connection.execute(text("ALTER TABLE user_profiles ADD COLUMN avoid_places JSON" if engine.dialect.name == "sqlite" else "ALTER TABLE user_profiles ADD COLUMN avoid_places JSONB"))
-        empty_list = "'[]'" if engine.dialect.name == "sqlite" else "CAST('[]' AS JSONB)"
-        connection.execute(text(f"UPDATE user_profiles SET avoid_places = {empty_list} WHERE avoid_places IS NULL"))
-
-
-def ensure_itinerary_columns() -> None:
-    columns = {column["name"] for column in inspect(engine).get_columns("itineraries")}
-    timestamp_type = "TIMESTAMP" if engine.dialect.name == "postgresql" else "DATETIME"
-    with engine.begin() as connection:
-        if "preferences" not in columns:
-            connection.execute(text("ALTER TABLE itineraries ADD COLUMN preferences JSON" if engine.dialect.name == "sqlite" else "ALTER TABLE itineraries ADD COLUMN preferences JSONB"))
-        if "deleted_at" not in columns:
-            connection.execute(text(f"ALTER TABLE itineraries ADD COLUMN deleted_at {timestamp_type}"))
-        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_itineraries_deleted_at ON itineraries (deleted_at)"))
+def alembic_config() -> Config:
+    backend_root = Path(__file__).resolve().parent.parent
+    config = Config(str(backend_root / "alembic.ini"))
+    config.set_main_option("script_location", str(backend_root / "migrations"))
+    config.set_main_option("sqlalchemy.url", settings.database_url)
+    return config
 
 
 def allocate_public_id(db: Session) -> str:
@@ -123,49 +87,17 @@ def backfill_user_public_ids() -> None:
         db.close()
 
 
-def ensure_session_management_columns() -> None:
-    """Keep existing development databases compatible until formal migrations land."""
-    columns = {column["name"] for column in inspect(engine).get_columns("chat_sessions")}
-    timestamp_type = "TIMESTAMP" if engine.dialect.name == "postgresql" else "DATETIME"
-    additions = {
-        "is_pinned": "BOOLEAN NOT NULL DEFAULT false",
-        "archived_at": timestamp_type,
-        "deleted_at": timestamp_type,
-        "updated_at": timestamp_type,
-    }
-    with engine.begin() as connection:
-        for name, definition in additions.items():
-            if name not in columns:
-                connection.execute(text(f"ALTER TABLE chat_sessions ADD COLUMN {name} {definition}"))
-
-
-def ensure_content_status_columns() -> None:
-    """Backfill publish status for development databases created before content deactivation."""
-    with engine.begin() as connection:
-        for table in ("cities", "attractions"):
-            columns = {column["name"] for column in inspect(engine).get_columns(table)}
-            if "is_active" not in columns:
-                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT true"))
-            connection.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_is_active ON {table} (is_active)"))
-
-
-def ensure_feedback_workflow_columns() -> None:
-    """Add feedback workflow fields for development databases created before the inbox workflow."""
-    columns = {column["name"] for column in inspect(engine).get_columns("itinerary_feedback")}
-    timestamp_type = "TIMESTAMP" if engine.dialect.name == "postgresql" else "DATETIME"
-    additions = {
-        "status": "VARCHAR(20) NOT NULL DEFAULT 'open'",
-        "assigned_admin_id": "INTEGER",
-        "admin_reply": "TEXT",
-        "replied_at": timestamp_type,
-        "handled_at": timestamp_type,
-    }
-    with engine.begin() as connection:
-        for name, definition in additions.items():
-            if name not in columns:
-                connection.execute(text(f"ALTER TABLE itinerary_feedback ADD COLUMN {name} {definition}"))
-        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_itinerary_feedback_status ON itinerary_feedback (status)"))
-        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_itinerary_feedback_assigned_admin_id ON itinerary_feedback (assigned_admin_id)"))
+def ensure_database_migrated() -> None:
+    config = alembic_config()
+    expected_revision = ScriptDirectory.from_config(config).get_current_head()
+    with engine.connect() as connection:
+        current_revision = MigrationContext.configure(connection).get_current_revision()
+    if current_revision != expected_revision:
+        raise RuntimeError(
+            "Database schema is not at the required Alembic revision. "
+            "Run `alembic upgrade head` before starting the application. "
+            "For an existing pre-Alembic database, back it up and run `alembic stamp head` followed by `alembic check`."
+        )
 
 
 def seed_database() -> None:
@@ -525,21 +457,23 @@ def verification_retry_after(db: Session, user_id: int) -> int:
     if latest is None:
         return 0
     elapsed = (datetime.now(timezone.utc).replace(tzinfo=None) - latest.created_at).total_seconds()
-    return max(0, int(VERIFICATION_RESEND_COOLDOWN_SECONDS - elapsed + 0.999))
+    return min(
+        VERIFICATION_RESEND_COOLDOWN_SECONDS,
+        max(0, int(VERIFICATION_RESEND_COOLDOWN_SECONDS - elapsed + 0.999)),
+    )
 
 
-def verification_response(email: str, dev_verification_code: str | None) -> dict:
+def verification_response(email: str) -> dict:
     masked = mask_email(email)
     return {
         "message": f"如果该邮箱需要验证，验证码已发送至 {masked}，验证码 {settings.email_verification_code_minutes} 分钟内有效；60 秒后可以重新发送。",
-        "dev_verification_code": dev_verification_code,
         "masked_email": masked,
         "expires_in_seconds": settings.email_verification_code_minutes * 60,
         "retry_after_seconds": VERIFICATION_RESEND_COOLDOWN_SECONDS,
     }
 
 
-def issue_email_verification_code(db: Session, user: User, target_email: str) -> str | None:
+def issue_email_verification_code(db: Session, user: User, target_email: str) -> None:
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     db.execute(update(AuthActionToken).where(
         AuthActionToken.user_id == user.id,
@@ -553,6 +487,7 @@ def issue_email_verification_code(db: Session, user: User, target_email: str) ->
         token_hash=token_hash(f"verify_email:{target_email.lower()}:{raw_code}"),
         target_email=target_email,
         expires_at=now + timedelta(minutes=settings.email_verification_code_minutes),
+        created_at=now,
     )
     db.add(action_token)
     db.commit()
@@ -568,9 +503,6 @@ def issue_email_verification_code(db: Session, user: User, target_email: str) ->
         action_token.used_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.commit()
         raise HTTPException(status_code=503, detail="验证码暂时发送失败，请稍后重试") from exc
-    if settings.environment == "development" and settings.mail_delivery_mode == "console":
-        return raw_code
-    return None
 
 
 def issue_auth_action(db: Session, user: User, purpose: str, target_email: str, path: str, expires_minutes: int) -> str | None:
@@ -711,22 +643,6 @@ def set_auth_cookies(response: Response, user: User, request: Request, db: Sessi
 def clear_auth_cookies(response: Response) -> None:
     for cookie_name in ["__Host-access_token", "access_token", "__Host-refresh_token", "refresh_token", "csrf_token"]:
         response.delete_cookie(cookie_name, path="/")
-
-
-@app.get("/api/v1/health/live")
-def live():
-    return {"status": "ok"}
-
-
-@app.get("/api/v1/health/ready")
-def ready(db: Session = Depends(get_db)):
-    db.execute(text("SELECT 1"))
-    return {"status": "ready"}
-
-
-@app.get("/api/v1/agent/status")
-def agent_status():
-    return get_llm_status()
 
 
 @app.get("/api/v1/admin/agent-status")
@@ -876,7 +792,8 @@ def resend_verification(data: EmailRequestIn, request: Request, db: Session = De
                 "expires_in_seconds": settings.email_verification_code_minutes * 60,
                 "retry_after_seconds": retry_after,
             }
-        return verification_response(email, issue_email_verification_code(db, user, email))
+        issue_email_verification_code(db, user, email)
+        return verification_response(email)
     return {
         "message": f"如果该邮箱需要验证，验证码已发送至 {mask_email(email)}，请检查收件箱；60 秒后可以重新发送。",
         "masked_email": mask_email(email),
@@ -2890,6 +2807,10 @@ def apply_structured_replan_actions(db: Session, itinerary: Itinerary, snapshot:
             if action.value is None:
                 raise HTTPException(422, "set_budget 必须提供 value")
             snapshot["budget_total"] = action.value
+        elif action.type == "set_preferences":
+            if action.preferences is None:
+                raise HTTPException(422, "set_preferences 必须提供 preferences")
+            snapshot["preferences"] = list(dict.fromkeys(item.strip() for item in action.preferences if item.strip()))
         elif action.type == "remove_attraction":
             if action.attraction_id is None:
                 raise HTTPException(422, "remove_attraction 必须提供 attraction_id")
@@ -2920,44 +2841,122 @@ def apply_structured_replan_actions(db: Session, itinerary: Itinerary, snapshot:
         raise HTTPException(422, f"调整后门票估算 ¥{total_ticket} 超出预算 ¥{snapshot['budget_total']}")
 
 
-@app.post("/api/v1/itineraries/{itinerary_id}/replan", response_model=dict)
-def replan_itinerary(itinerary_id: int, data: ReplanIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    """Apply safe, explicit natural-language edits locally; full LLM re-planning remains a later integration."""
-    ensure_csrf(request)
+def replan_action_summary(actions: list[ReplanActionIn], attractions: dict[int, Attraction]) -> str:
+    parts = []
+    for action in actions:
+        if action.type == "set_days":
+            parts.append(f"调整为 {action.value} 天")
+        elif action.type == "set_budget":
+            parts.append(f"预算调整为 ¥{action.value}")
+        elif action.type == "set_preferences":
+            parts.append(f"偏好更新为 {'、'.join(action.preferences or []) or '无'}")
+        elif action.type == "remove_attraction":
+            parts.append(f"删除 {attractions.get(action.attraction_id).name if attractions.get(action.attraction_id) else '指定景点'}")
+        elif action.type == "replace_attraction":
+            source = attractions.get(action.attraction_id)
+            target = attractions.get(action.new_attraction_id)
+            parts.append(f"{source.name if source else '指定景点'} 替换为 {target.name if target else '指定景点'}")
+    return "；".join(parts)
+
+
+def local_replan_preview(instruction: str, snapshot: dict, attractions: list[Attraction]) -> tuple[list[ReplanActionIn], list[str]]:
+    actions: list[ReplanActionIn] = []
+    questions: list[str] = []
+    current_stop_ids = {stop.get("attraction_id") for day in snapshot.get("itinerary_days", []) for stop in day.get("stops", [])}
+    current_stops = [item for item in attractions if item.id in current_stop_ids]
+
+    day_match = re.search(r"(?:改成|调整为|安排为|延长到|缩短到)\s*(\d+)\s*[天日]", instruction)
+    if day_match:
+        actions.append(ReplanActionIn(type="set_days", value=max(1, min(int(day_match.group(1)), 10))))
+
+    budget_match = re.search(r"(?:预算|花费|总价|控制在|不超过)[^\d]{0,8}(\d{2,7})\s*(?:元|块)?", instruction)
+    if budget_match:
+        actions.append(ReplanActionIn(type="set_budget", value=int(budget_match.group(1))))
+
+    preferences = [word for word in ("摄影", "美食", "历史文化", "自然风景", "夜景", "购物", "亲子", "轻松慢游", "紧凑打卡") if word in instruction]
+    if preferences and any(marker in instruction for marker in ("偏好", "喜欢", "想体验", "多安排", "轻松", "紧凑")):
+        actions.append(ReplanActionIn(type="set_preferences", preferences=preferences))
+
+    if any(marker in instruction for marker in ("删除", "去掉", "不要")):
+        matches = [item for item in current_stops if item.name in instruction]
+        if len(matches) == 1:
+            actions.append(ReplanActionIn(type="remove_attraction", attraction_id=matches[0].id))
+        elif len(matches) > 1:
+            questions.append("你想删除哪一个景点？请写出完整景点名称。")
+        else:
+            names = "、".join(item.name for item in current_stops)
+            questions.append(f"请说明要删除的景点。当前行程包含：{names or '暂无景点'}。")
+
+    replacement_match = re.search(r"(?:把|将)\s*([^，。；;]+?)\s*(?:替换成|换成)\s*([^，。；;]+)", instruction)
+    if replacement_match:
+        source_name, target_name = (value.strip() for value in replacement_match.groups())
+        source_matches = [item for item in current_stops if item.name == source_name or source_name in item.name]
+        target_matches = [item for item in attractions if item.name == target_name or target_name in item.name]
+        if len(source_matches) == 1 and len(target_matches) == 1:
+            actions.append(ReplanActionIn(type="replace_attraction", attraction_id=source_matches[0].id, new_attraction_id=target_matches[0].id))
+        else:
+            questions.append("请写出要替换的原景点和新景点的完整名称，并确保新景点属于当前城市。")
+
+    unsupported = [word for word in ("酒店", "餐厅", "机票", "火车票", "导航", "天气") if word in instruction]
+    if unsupported:
+        questions.append(f"当前不能直接修改{'、'.join(unsupported)}安排；请说明要调整的天数、预算或具体景点。")
+    if not actions and not questions:
+        questions.append("你想改哪一项？可以说明天数、预算、偏好，或写出要删除、替换的具体景点名称。")
+    return actions, questions[:3]
+
+
+def replan_preview(db: Session, itinerary: Itinerary, instruction: str) -> ReplanPreviewOut:
+    snapshot = itinerary_dict(db, itinerary.id) or {}
+    city = db.scalar(select(City).where(City.name == itinerary.city_name))
+    if not city:
+        raise HTTPException(409, "行程所属城市资料不存在，无法解析调整要求")
+    attractions = list(db.scalars(select(Attraction).where(Attraction.city_id == city.id, Attraction.is_active.is_(True)).order_by(Attraction.id)))
+    attraction_by_id = {item.id: item for item in attractions}
+    model_result = generate_replan_interpretation(
+        instruction,
+        {"days": snapshot.get("days"), "budget_total": snapshot.get("budget_total"), "preferences": snapshot.get("preferences"), "stops": [stop for day in snapshot.get("itinerary_days", []) for stop in day.get("stops", [])]},
+        [{"id": item.id, "name": item.name, "tags": item.tags} for item in attractions],
+    )
+    parser = "llm" if model_result else "local"
+    if model_result:
+        try:
+            status_value = model_result.get("status")
+            actions = [ReplanActionIn.model_validate(item) for item in model_result.get("actions", [])]
+            questions = [str(item).strip()[:180] for item in model_result.get("questions", []) if str(item).strip()][:3]
+            if status_value == "ready" and actions:
+                apply_structured_replan_actions(db, itinerary, copy.deepcopy(snapshot), actions)
+                return ReplanPreviewOut(status="ready", summary=replan_action_summary(actions, attraction_by_id), actions=actions, parser=parser)
+            if questions:
+                return ReplanPreviewOut(status="needs_clarification", summary="需要补充信息后才能安全调整行程", questions=questions, parser=parser)
+        except (HTTPException, TypeError, ValueError):
+            parser = "local"
+
+    actions, questions = local_replan_preview(instruction, snapshot, attractions)
+    if questions:
+        return ReplanPreviewOut(status="needs_clarification", summary="需要补充信息后才能安全调整行程", questions=questions, parser=parser)
+    apply_structured_replan_actions(db, itinerary, copy.deepcopy(snapshot), actions)
+    return ReplanPreviewOut(status="ready", summary=replan_action_summary(actions, attraction_by_id), actions=actions, parser=parser)
+
+
+@app.post("/api/v1/itineraries/{itinerary_id}/replan/preview", response_model=ReplanPreviewOut)
+def preview_replan_itinerary(itinerary_id: int, data: ReplanIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
     itinerary = itinerary_for_user(itinerary_id, user, db)
     instruction = data.instruction.strip()
+    if not instruction:
+        raise HTTPException(422, "请先说明希望如何调整行程")
+    return replan_preview(db, itinerary, instruction)
+
+
+@app.post("/api/v1/itineraries/{itinerary_id}/replan", response_model=dict)
+def replan_itinerary(itinerary_id: int, data: ReplanIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Apply only actions that the user has reviewed in the preview step."""
+    ensure_csrf(request)
+    itinerary = itinerary_for_user(itinerary_id, user, db)
     snapshot = itinerary_dict(db, itinerary_id) or {}
     structured_actions = list(data.actions)
-    if structured_actions:
-        apply_structured_replan_actions(db, itinerary, snapshot, structured_actions)
-    day_match = re.search(r"(?:改成|调整为|安排为)\s*(\d+)\s*[天日]", instruction)
-    budget_match = re.search(r"预算[^\d]{0,8}(\d{2,7})", instruction)
-    delete_match = re.search(r"(?:删除|去掉|不要)[^，。；;]*?([\u4e00-\u9fff]{2,20})", instruction)
-    replacement_match = re.search(r"(?:把|将)\s*([^，。；;]+?)\s*(?:替换成|换成)\s*([^，。；;]+)", instruction)
-    if day_match:
-        target_days = max(1, min(int(day_match.group(1)), 10))
-        current_days = snapshot.get("itinerary_days", [])
-        while len(current_days) < target_days:
-            number = len(current_days) + 1
-            current_days.append({"day_number": number, "title": f"第{number}天 · {itinerary.city_name}探索", "stops": []})
-        snapshot["itinerary_days"] = current_days[:target_days]
-    if budget_match:
-        snapshot["budget_total"] = int(budget_match.group(1))
-    if delete_match:
-        keyword = delete_match.group(1).strip()
-        for day in snapshot.get("itinerary_days", []):
-            day["stops"] = [stop for stop in day.get("stops", []) if keyword not in stop.get("name", "")]
-    if replacement_match:
-        old_name, new_name = replacement_match.groups()
-        replacement = db.scalar(select(Attraction).where(Attraction.city_id == db.scalar(select(City.id).where(City.name == itinerary.city_name)), Attraction.is_active.is_(True), Attraction.name.contains(new_name.strip())))
-        for day in snapshot.get("itinerary_days", []):
-            for stop in day.get("stops", []):
-                if old_name.strip() in stop.get("name", "") and replacement:
-                    stop["attraction_id"] = replacement.id
-                    stop["name"] = replacement.name
-                    stop["note"] = f"{replacement.area} · 建议游览{replacement.duration_minutes}分钟 · 开放时间{replacement.opening_hours}"
-    if not structured_actions and not any([day_match, budget_match, delete_match, replacement_match]):
-        raise HTTPException(422, "请说明要调整的天数、预算、景点删除或替换内容")
+    if not structured_actions:
+        raise HTTPException(409, "请先预览调整结果，确认后再保存")
+    apply_structured_replan_actions(db, itinerary, snapshot, structured_actions)
     current = itinerary_dict(db, itinerary_id) or {}
     save_itinerary_revision(db, itinerary.id, current, "自然语言调整前自动保存")
     itinerary.budget_total = snapshot.get("budget_total", itinerary.budget_total)
@@ -3019,6 +3018,30 @@ def create_share(itinerary_id: int, data: ShareCreateIn, request: Request, user:
     db.commit()
     db.refresh(share)
     return {"id": share.id, "share_url": f"{settings.app_base_url.rstrip('/')}/share/itineraries/{raw_token}", "expires_at": share.expires_at, "created_at": share.created_at}
+
+
+@app.get("/api/v1/shares", response_model=list[ShareHistoryOut])
+def list_my_shares(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    rows = db.execute(
+        select(ShareLink, Itinerary)
+        .join(Itinerary, Itinerary.id == ShareLink.itinerary_id)
+        .where(Itinerary.user_id == user.id)
+        .order_by(ShareLink.created_at.desc(), ShareLink.id.desc())
+    ).all()
+    return [
+        {
+            "id": share.id,
+            "itinerary_id": itinerary.id,
+            "itinerary_title": itinerary.title,
+            "city_name": itinerary.city_name,
+            "status": "revoked" if share.revoked_at else "expired" if share.expires_at <= now else "active",
+            "expires_at": share.expires_at,
+            "revoked_at": share.revoked_at,
+            "created_at": share.created_at,
+        }
+        for share, itinerary in rows
+    ]
 
 
 @app.get("/api/v1/shares/{token}")
@@ -3200,7 +3223,7 @@ def admin_users(
     db: Session = Depends(get_db),
 ):
     require_admin(user)
-    filters = []
+    filters = [User.email_verified_at.is_not(None)]
     if status_filter == "active":
         filters.append(User.is_active.is_(True))
     elif status_filter == "disabled":

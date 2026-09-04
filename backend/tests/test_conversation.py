@@ -297,24 +297,48 @@ def test_plan_requires_confirmation_and_idempotency():
         assert itinerary["city_name"] == "上海"
         assert itinerary["days"] == 3
         assert itinerary["preferences"] == ["摄影", "美食"]
-        assert itinerary["validation"]["daily_load"]["status"] == "partial"
+        assert itinerary["validation"]["daily_load"]["status"] == "passed"
         assert itinerary["validation"]["travel"]["status"] == "partial"
         assert itinerary["budget_scope"] == "门票、景点间市内交通、餐饮和住宿估算；未覆盖跨城交通和购物"
 
 
 def test_plan_uses_amap_segments_and_complete_budget(monkeypatch):
+    calls: list[str] = []
+
     def fake_search_place(keyword: str, city: str | None = None, max_pois: int = 10):
         offset = sum(ord(char) for char in keyword) % 100
         return {"location": f"121.{offset:02d},31.{offset:02d}", "citycode": "021"}
 
+    def fake_weather(city_code: str | None, travel_date: date | None):
+        calls.append("weather")
+        return {"status": "passed", "provider": "高德天气", "date": travel_date.isoformat(), "day_weather": "晴", "day_temp": "28"}
+
+    def fake_geocode(address: str):
+        calls.append(f"geocode:{address}")
+        offset = sum(ord(char) for char in address) % 100
+        return {"coordinate": (31 + offset / 1000, 121 + offset / 1000), "citycode": "021"}
+
     def fake_route(origin, destination, transport, city_code=None, destination_city_code=None, travel_date=None):
+        calls.append(f"route:{transport}")
         return {
             "provider": "amap", "transport": transport, "distance_meters": 1800,
             "duration_seconds": 900, "cost_yuan": 3.0, "cost_source": "高德公交票价", "cost_basis": "per_person",
         }
 
+    def fake_nearby_food(coordinate, city: str, limit: int = 2):
+        calls.append("food")
+        return [{"name": "测试餐厅", "address": "测试地址", "distance_meters": 320}]
+
     monkeypatch.setattr("app.services.search_amap_place", fake_search_place)
+    monkeypatch.setattr("app.services.request_amap_weather", fake_weather)
+    monkeypatch.setattr("app.services.request_amap_geocode", fake_geocode)
     monkeypatch.setattr("app.services.request_amap_route", fake_route)
+    monkeypatch.setattr("app.services.request_amap_nearby_food", fake_nearby_food)
+    with SessionLocal() as db:
+        for attraction in db.query(Attraction).join(City).filter(City.name == "上海").all():
+            attraction.latitude = None
+            attraction.longitude = None
+        db.commit()
     with TestClient(app) as client:
         client.post("/api/v1/auth/login", json={"account": "admin", "password": os.environ["ADMIN_INITIAL_PASSWORD"]})
         csrf = client.cookies.get("csrf_token")
@@ -330,7 +354,7 @@ def test_plan_uses_amap_segments_and_complete_budget(monkeypatch):
             f"/api/v1/sessions/{session_id}/plan-confirm",
             json={"confirmed": True, "patch": {
                 "destination_city_id": shanghai["id"], "days": 2, "start_date": "2026-09-08",
-                "budget_total": 3000, "interests": ["摄影", "美食"], "traveler_count": 2,
+                "attraction_count": 3, "budget_total": 3000, "interests": ["摄影", "美食"], "traveler_count": 2,
                 "transport": "public_transport",
             }},
             headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
@@ -341,13 +365,21 @@ def test_plan_uses_amap_segments_and_complete_budget(monkeypatch):
         travel = itinerary["validation"]["travel"]
         budget = itinerary["validation"]["budget"]
         assert travel["status"] == "passed"
-        assert travel["total_distance_meters"] == 3600
-        assert travel["total_duration_seconds"] == 1800
-        assert budget["breakdown"]["local_transport"] == 12.0
+        assert travel["total_distance_meters"] == 1800
+        assert travel["total_duration_seconds"] == 900
+        assert budget["breakdown"]["local_transport"] == 6.0
         assert budget["breakdown"]["meals"] == 480
         assert budget["breakdown"]["hotel"] == 350
         assert budget["breakdown"]["total"] == itinerary["budget_total"]
         assert itinerary["validation"]["opening_hours"]["status"] == "passed"
+        assert itinerary["validation"]["weather"]["status"] == "passed"
+        assert len(itinerary["validation"]["driving_navigation"]["segments"]) == 2
+        assert len(itinerary["validation"]["nearby_food"]) == 3
+        assert len([stop for day in itinerary["itinerary_days"] for stop in day["stops"]]) == 3
+        first_geocode = min(index for index, call in enumerate(calls) if call.startswith("geocode:"))
+        first_driving_route = calls.index("route:driving")
+        first_food = calls.index("food")
+        assert calls.index("weather") < first_geocode < first_driving_route < first_food
 
 
 def test_plan_includes_round_trip_intercity_route_and_budget(monkeypatch):
@@ -454,7 +486,7 @@ def test_longer_plan_uses_available_attractions_without_fabrication():
         session_id = client.post("/api/v1/sessions", json={}, headers={"X-CSRF-Token": csrf}).json()["id"]
         message = client.post(
             f"/api/v1/sessions/{session_id}/messages",
-            json={"content": "成都4天美食慢节奏行程"},
+            json={"content": "成都4天美食慢节奏行程，安排4个景点"},
             headers={"X-CSRF-Token": csrf, "Idempotency-Key": str(uuid.uuid4())},
         )
         wait_for_job(client, message.json()["job_id"])
@@ -467,7 +499,7 @@ def test_longer_plan_uses_available_attractions_without_fabrication():
         assert job["status"] == "completed"
         itinerary = client.get(f"/api/v1/itineraries/{job['result_itinerary_id']}").json()
         assert itinerary["days"] == 4
-        assert itinerary["validation"]["daily_load"]["status"] == "partial"
+        assert itinerary["validation"]["daily_load"]["status"] == "passed"
         stops = [stop for day in itinerary["itinerary_days"] for stop in day["stops"]]
         assert len(stops) == len({stop["attraction_id"] for stop in stops}) == 4
 
@@ -496,8 +528,8 @@ def test_plan_persists_agent_tool_trace_and_repairs_ticket_budget():
         payload = trace.json()
         assert payload["algorithm_version"] == "amap-route-v2"
         tool_names = [step["tool_name"] for step in payload["steps"]]
-        assert tool_names[0] == "search_attractions"
-        assert {"repair_plan", "select_stops", "get_attraction_detail", "resolve_attraction_coordinates", "calculate_amap_routes", "estimate_budget", "validate_schedule", "validate_plan", "save_itinerary_draft"}.issubset(tool_names)
+        assert tool_names[0] == "query_weather"
+        assert {"repair_plan", "select_stops", "get_attraction_detail", "resolve_attraction_coordinates", "calculate_driving_navigation", "search_nearby_food", "calculate_amap_routes", "estimate_budget", "validate_schedule", "validate_plan", "save_itinerary_draft"}.issubset(tool_names)
         assert tool_names[-1] == "save_itinerary_draft"
         assert payload["summary"]["budget_repair_applied"] is True
         assert payload["summary"]["repair_attempts"] == 1
@@ -512,6 +544,40 @@ def test_plan_persists_agent_tool_trace_and_repairs_ticket_budget():
         )
         assert replanned.status_code == 200
         assert stop_id not in {stop["attraction_id"] for day in replanned.json()["itinerary_days"] for stop in day["stops"]}
+
+        before_preview = client.get(f"/api/v1/itineraries/{job['result_itinerary_id']}").json()
+        preview = client.post(
+            f"/api/v1/itineraries/{job['result_itinerary_id']}/replan/preview",
+            json={"instruction": "把行程改成 3 天，预算调整为 1200 元"},
+        )
+        assert preview.status_code == 200
+        assert preview.json()["status"] == "ready"
+        assert {action["type"] for action in preview.json()["actions"]} == {"set_days", "set_budget"}
+        assert client.get(f"/api/v1/itineraries/{job['result_itinerary_id']}").json()["days"] == before_preview["days"]
+
+        confirmed_replan = client.post(
+            f"/api/v1/itineraries/{job['result_itinerary_id']}/replan",
+            json={"instruction": "把行程改成 3 天，预算调整为 1200 元", "actions": preview.json()["actions"]},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert confirmed_replan.status_code == 200
+        assert confirmed_replan.json()["days"] == 3
+        assert confirmed_replan.json()["budget_total"] == 1200
+
+        clarification = client.post(
+            f"/api/v1/itineraries/{job['result_itinerary_id']}/replan/preview",
+            json={"instruction": "安排得轻松一点"},
+        )
+        assert clarification.status_code == 200
+        assert clarification.json()["status"] == "needs_clarification"
+        assert clarification.json()["questions"]
+
+        unconfirmed = client.post(
+            f"/api/v1/itineraries/{job['result_itinerary_id']}/replan",
+            json={"instruction": "改成 4 天"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert unconfirmed.status_code == 409
 
 
 def test_model_failure_diagnostics_are_restricted_to_administrators():

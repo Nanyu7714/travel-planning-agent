@@ -2,14 +2,17 @@
 import { onMounted, ref } from 'vue'
 import { ArrowDown, ArrowLeft, ArrowUp, Bot, Check, Clock3, Copy, Edit3, Heart, History, Map, Plus, Save, Send, Star, Trash2, X } from 'lucide-vue-next'
 import { useRoute } from 'vue-router'
-import { createShare as createShareApi, getAttractions, getCities, getFavorites, getFeedback, getItinerary, getItineraryAgentRun, getItineraryRevisions, replanItinerary, restoreItineraryRevision, saveFeedback, setFavorite, updateItinerary, type AgentRun, type Attraction, type Itinerary } from '../api'
-const route = useRoute(); const itinerary = ref<Itinerary | null>(null); const draft = ref<Itinerary | null>(null); const attractions = ref<Attraction[]>([]); const agentRun = ref<AgentRun | null>(null); const revisions = ref<{ id:number; version_no:number; reason:string; created_at:string }[]>([]); const feedback = ref<{ rating:number|null; comment:string; average:number|null; count:number; status:'open'|'in_progress'|'resolved'|null; admin_reply:string|null; replied_at:string|null }>({ rating:null, comment:'', average:null, count:0, status:null, admin_reply:null, replied_at:null }); const editing = ref(false); const showHistory = ref(false); const saving = ref(false); const instruction = ref(''); const shareUrl = ref(''); const favorite = ref(false); const error = ref(''); const message = ref(''); const rating = ref(0); const comment = ref('')
+import { createShare as createShareApi, getAttractions, getCities, getFavorites, getFeedback, getItinerary, getItineraryAgentRun, getItineraryRevisions, previewReplanItinerary, replanItinerary, restoreItineraryRevision, saveFeedback, setFavorite, updateItinerary, type AgentRun, type Attraction, type Itinerary, type ReplanPreview } from '../api'
+const route = useRoute(); const itinerary = ref<Itinerary | null>(null); const draft = ref<Itinerary | null>(null); const attractions = ref<Attraction[]>([]); const agentRun = ref<AgentRun | null>(null); const revisions = ref<{ id:number; version_no:number; reason:string; created_at:string }[]>([]); const feedback = ref<{ rating:number|null; comment:string; average:number|null; count:number; status:'open'|'in_progress'|'resolved'|null; admin_reply:string|null; replied_at:string|null }>({ rating:null, comment:'', average:null, count:0, status:null, admin_reply:null, replied_at:null }); const editing = ref(false); const showHistory = ref(false); const saving = ref(false); const instruction = ref(''); const replanPreview = ref<ReplanPreview | null>(null); const shareUrl = ref(''); const favorite = ref(false); const error = ref(''); const message = ref(''); const rating = ref(0); const comment = ref('')
 async function load() { try { const id = Number(route.params.id); const [current, currentFeedback, cities, favorites] = await Promise.all([getItinerary(id), getFeedback(id), getCities(), getFavorites()]); itinerary.value = current; draft.value = structuredClone(current); feedback.value = currentFeedback; rating.value = currentFeedback.rating || 0; comment.value = currentFeedback.comment; favorite.value = favorites.some((item) => item.target_type === 'itinerary' && item.target_id === id); const city = cities.find((item) => item.name === current.city_name); attractions.value = city ? await getAttractions(city.id) : []; agentRun.value = await getItineraryAgentRun(id).catch(() => null) } catch (e) { error.value = e instanceof Error ? e.message : '行程加载失败' } }
-function agentStepName(name: string) { return ({ search_attractions: '检索景点资料', select_stops: '筛选候选景点', validate_plan: '校验行程约束' } as Record<string, string>)[name] || name }
+function agentStepName(name: string) { return ({ query_weather: '查询计划天气', search_attractions: '检索景点资料', select_stops: '筛选候选景点', resolve_attraction_coordinates: '景点地址转坐标', calculate_driving_navigation: '规划驾车导航', search_nearby_food: '查询附近美食', validate_plan: '校验行程约束' } as Record<string, string>)[name] || name }
 function validationSection(name: string): Record<string, any> { return (itinerary.value?.validation?.[name] || {}) as Record<string, any> }
 function formatDuration(seconds: unknown) { const minutes = Math.max(0, Math.round(Number(seconds || 0) / 60)); return minutes >= 60 ? `${Math.floor(minutes / 60)}小时${minutes % 60}分钟` : `${minutes}分钟` }
 function formatDistance(meters: unknown) { const value = Number(meters || 0); return value >= 1000 ? `${(value / 1000).toFixed(1)}公里` : `${value}米` }
 function transportName(value: unknown) { return ({ public_transport: '公共交通', taxi: '打车', walking: '步行优先', driving: '自驾' } as Record<string, string>)[String(value)] || '未指定' }
+function weatherSummary() { const weather = validationSection('weather'); return weather.status === 'passed' ? `${weather.date}，白天${weather.day_weather || '天气未知'} ${weather.day_temp || '--'}°C，夜间${weather.night_temp || '--'}°C` : weather.reason || '天气信息暂不可用' }
+function nearbyFoodGroups(): Array<{ attraction_id: number; attraction_name: string; items: Array<{ name: string; address?: string; distance_meters?: number }> }> { const groups = itinerary.value?.validation?.nearby_food; return Array.isArray(groups) ? groups as Array<{ attraction_id: number; attraction_name: string; items: Array<{ name: string; address?: string; distance_meters?: number }> }> : [] }
+function foodSummary(items: Array<{ name: string; distance_meters?: number }>) { return items.map((item) => `${item.name}${item.distance_meters ? `（${formatDistance(item.distance_meters)}）` : ''}`).join('、') }
 function edit() { if (itinerary.value) { draft.value = structuredClone(itinerary.value); editing.value = true } }
 async function save() { if (!draft.value || !itinerary.value) return; saving.value = true; try { itinerary.value = await updateItinerary(itinerary.value.id, { title: draft.value.title, budget_total: draft.value.budget_total, preferences: draft.value.preferences, expected_version: itinerary.value.lock_version, itinerary_days: draft.value.itinerary_days }); draft.value = structuredClone(itinerary.value); editing.value = false; message.value = '行程已保存' } catch (e) { error.value = e instanceof Error ? e.message : '保存失败' } finally { saving.value = false } }
 function moveStop(day: Itinerary['itinerary_days'][number], index: number, offset: number) { const target = index + offset; if (target < 0 || target >= day.stops.length) return; const item = day.stops[index]; day.stops.splice(index, 1); day.stops.splice(target, 0, item) }
@@ -18,7 +21,8 @@ function addStop(day: Itinerary['itinerary_days'][number]) { if (!draft.value) r
 function removeStop(day: Itinerary['itinerary_days'][number], index: number) { day.stops.splice(index, 1) }
 function addDay() { if (!draft.value || draft.value.itinerary_days.length >= 10) return; const number = draft.value.itinerary_days.length + 1; draft.value.itinerary_days.push({ day_number: number, title: `第${number}天 · ${draft.value.city_name}探索`, stops: [] }); draft.value.days = draft.value.itinerary_days.length }
 function removeDay(index: number) { if (!draft.value || draft.value.itinerary_days.length <= 1) return; draft.value.itinerary_days.splice(index, 1); draft.value.itinerary_days.forEach((day, dayIndex) => { day.day_number = dayIndex + 1 }); draft.value.days = draft.value.itinerary_days.length }
-async function replan() { if (!itinerary.value || !instruction.value.trim()) return; saving.value = true; try { itinerary.value = await replanItinerary(itinerary.value.id, instruction.value); draft.value = structuredClone(itinerary.value); instruction.value = ''; message.value = '已按要求调整行程' } catch (e) { error.value = e instanceof Error ? e.message : '自然语言调整失败' } finally { saving.value = false } }
+async function replan() { if (!itinerary.value || !instruction.value.trim()) return; saving.value = true; error.value = ''; try { replanPreview.value = await previewReplanItinerary(itinerary.value.id, instruction.value); if (replanPreview.value.status === 'needs_clarification') message.value = '请补充下面的问题，行程尚未改动' } catch (e) { error.value = e instanceof Error ? e.message : '调整分析失败' } finally { saving.value = false } }
+async function confirmReplan() { if (!itinerary.value || !replanPreview.value?.actions.length) return; saving.value = true; error.value = ''; try { itinerary.value = await replanItinerary(itinerary.value.id, instruction.value, replanPreview.value.actions); draft.value = structuredClone(itinerary.value); instruction.value = ''; replanPreview.value = null; message.value = '已按确认内容调整行程' } catch (e) { error.value = e instanceof Error ? e.message : '自然语言调整失败' } finally { saving.value = false } }
 async function history() { if (!itinerary.value) return; showHistory.value = !showHistory.value; if (showHistory.value) revisions.value = await getItineraryRevisions(itinerary.value.id) }
 async function restore(version: number) { if (!itinerary.value || !window.confirm(`恢复到第 ${version} 个历史版本？`)) return; itinerary.value = await restoreItineraryRevision(itinerary.value.id, version); draft.value = structuredClone(itinerary.value); revisions.value = await getItineraryRevisions(itinerary.value.id); message.value = '历史版本已恢复' }
 async function submitFeedback() { if (!itinerary.value || !rating.value) return; await saveFeedback(itinerary.value.id, rating.value, comment.value); feedback.value = await getFeedback(itinerary.value.id); message.value = '感谢你的评分' }
@@ -53,6 +57,8 @@ onMounted(load)
           <div><span>景点间交通</span><strong>¥{{ validationSection('travel').total_cost || 0 }}</strong></div>
         </div>
         <div class="intercity-facts">
+          <p><strong>计划天气</strong><span>{{ weatherSummary() }}</span></p>
+          <p><strong>驾车导航</strong><span>{{ validationSection('driving_navigation').message || '驾车路线待生成' }}</span></p>
           <p><strong>往返跨城</strong><span>{{ validationSection('intercity_travel').message || '未选择出发城市，暂未计算跨城费用' }}</span></p>
           <div v-if="validationSection('intercity_travel').origin_city" class="fact-grid">
             <div><span>路线</span><strong>{{ validationSection('intercity_travel').origin_city }} ↔ {{ validationSection('intercity_travel').destination_city }}</strong></div>
@@ -60,6 +66,10 @@ onMounted(load)
             <div><span>往返耗时</span><strong>{{ formatDuration(validationSection('intercity_travel').total_duration_seconds) }}</strong></div>
             <div><span>往返交通</span><strong>¥{{ validationSection('intercity_travel').total_cost || 0 }}</strong></div>
           </div>
+        </div>
+        <div v-if="nearbyFoodGroups().length" class="nearby-food">
+          <p><strong>景点附近美食</strong><span>按每个景点附近 1.5 公里查询</span></p>
+          <div v-for="group in nearbyFoodGroups()" :key="group.attraction_id" class="food-group"><strong>{{ group.attraction_name }}</strong><span v-if="group.items.length">{{ foodSummary(group.items) }}</span><span v-else>暂未查询到可推荐的美食</span></div>
         </div>
         <div class="budget-breakdown">
           <div><span>门票</span><strong>¥{{ validationSection('budget').breakdown?.tickets || 0 }}</strong></div>
@@ -105,8 +115,9 @@ onMounted(load)
 
       <section class="replan-panel">
         <div class="section-heading"><div><span class="eyebrow">NATURAL LANGUAGE EDIT</span><h2>告诉 AI 你想怎么改</h2></div><Map :size="19" /></div>
-        <div class="replan-line"><input v-model="instruction" placeholder="例如：把行程改成 3 天，预算调整为 1200 元" @keydown.enter="replan" /><button class="primary-button" :disabled="saving || !instruction.trim()" @click="replan"><Send :size="16" />调整</button></div>
-        <small>当前支持天数、预算、删除和替换景点等明确指令；完整大模型重新规划后续接入。</small>
+        <div class="replan-line"><input v-model="instruction" placeholder="例如：改成 3 天，预算 1200 元，并删除故宫博物院" @input="replanPreview = null" @keydown.enter="replan" /><button class="primary-button" :disabled="saving || !instruction.trim()" @click="replan"><Send :size="16" />分析</button></div>
+        <div v-if="replanPreview" class="replan-preview" :class="replanPreview.status"><strong>{{ replanPreview.summary }}</strong><template v-if="replanPreview.status === 'ready'"><p>确认后才会保存本次调整。</p><button class="secondary-button" :disabled="saving" @click="confirmReplan"><Check :size="16" />确认调整</button></template><ul v-else><li v-for="question in replanPreview.questions" :key="question">{{ question }}</li></ul></div>
+        <small>支持天数、预算、偏好，以及明确的景点删除或替换。表达不完整时会先提问，行程不会自动改动。</small>
       </section>
 
       <section v-if="agentRun" class="agent-trace-panel">
@@ -160,6 +171,10 @@ onMounted(load)
 .history-panel { padding-bottom: 12px; }
 .revision-row { border-top-color: var(--color-border-soft); }
 .replan-panel > small, .rating-line small { color: var(--color-muted); }
+.replan-preview { display: grid; gap: 10px; margin-top: 14px; padding: 14px; border: 1px solid var(--color-border-soft); background: var(--color-surface-soft); color: var(--color-ink); font-size: 13px; line-height: 1.5; }
+.replan-preview p, .replan-preview ul { margin: 0; }
+.replan-preview ul { padding-left: 20px; }
+.replan-preview.needs_clarification { border-left: 3px solid var(--color-primary); }
 .agent-trace-panel { max-width: 760px; margin-top: 25px; padding: 22px; }
 .trace-summary, .trace-note { margin: 14px 0 0; color: var(--color-muted); font-size: 14px; line-height: 1.5; }
 .trace-note { color: var(--color-ink); }
@@ -186,6 +201,10 @@ onMounted(load)
 .intercity-facts { margin-top: 18px; }
 .intercity-facts > p { display: grid; gap: 5px; margin: 0; color: var(--color-muted); font-size: 13px; line-height: 1.5; }
 .intercity-facts > p strong { color: var(--color-ink); }
+.nearby-food { display: grid; gap: 10px; margin-top: 18px; }
+.nearby-food > p { display: grid; gap: 5px; margin: 0; color: var(--color-muted); font-size: 13px; }
+.nearby-food > p strong, .food-group strong { color: var(--color-ink); }
+.food-group { display: grid; gap: 4px; padding: 12px; border: 1px solid var(--color-border-soft); background: var(--color-surface-soft); color: var(--color-muted); font-size: 13px; line-height: 1.5; }
 .fact-grid, .budget-breakdown { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin-top: 18px; border: 1px solid var(--color-border-soft); background: var(--color-border-soft); }
 .fact-grid > div, .budget-breakdown > div { display: grid; gap: 5px; padding: 13px; background: var(--color-surface); }
 .fact-grid span, .budget-breakdown span { color: var(--color-muted); font-size: 11px; }

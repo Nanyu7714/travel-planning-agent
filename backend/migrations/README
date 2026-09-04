@@ -1,1 +1,14 @@
-数据库表由应用首次启动自动创建。生产环境迁移目录保留给后续 Alembic 版本脚本。
+数据库结构由 Alembic 管理。首次部署或升级时，在 `backend` 目录执行：
+
+```powershell
+alembic upgrade head
+```
+
+已有的旧版开发数据库（此前由应用启动自动建表）应先备份，再执行：
+
+```powershell
+alembic stamp head
+alembic check
+```
+
+`stamp` 只写入当前迁移版本，不会重建表；仅适用于已与初始迁移结构一致的旧数据库。确认无误后，后续版本统一使用 `alembic upgrade head`。回退一个版本使用 `alembic downgrade -1`，回退到指定版本使用 `alembic downgrade <revision>`。

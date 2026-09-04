@@ -92,7 +92,7 @@ export type MediaAsset = { id: number; city_id: number; attraction_id: number | 
 export type SessionBulkAction = 'archive' | 'restore' | 'delete'
 export type CommunityComment = { id: number; body: string; created_at: string; author: { id: number; name: string }; can_manage: boolean }
 export type CommunityPost = { id: number; title: string; body: string; city_name: string; status: 'published' | 'hidden'; created_at: string; updated_at: string; author: { id: number; name: string }; itinerary: { title: string; city_name: string; days: number; budget_total: number; preferences: string[]; itinerary_days: { day_number: number; title: string; stops: { name: string; start_time: string; end_time: string }[] }[] }; images: { id: number; url: string; alt_text: string }[]; like_count: number; favorite_count: number; comment_count: number; liked: boolean; favorited: boolean; can_manage: boolean; comments?: CommunityComment[] }
-export type AuthAction = { message: string; dev_action_url?: string | null; dev_verification_code?: string | null; masked_email?: string | null; expires_in_seconds?: number | null; retry_after_seconds?: number | null }
+export type AuthAction = { message: string; dev_action_url?: string | null; masked_email?: string | null; expires_in_seconds?: number | null; retry_after_seconds?: number | null }
 
 export async function getCities() { return api<City[]>('/cities') }
 export async function searchCities(query: string) { return api<City[]>(`/cities/search?q=${encodeURIComponent(query)}`) }
@@ -127,10 +127,16 @@ export async function deleteAdminPhoto(id: number) { return api(`/admin/photos/$
 export async function usePhotoAsCover(id: number) { return api<MediaAsset>(`/admin/photos/${id}/use-as-cover`, { method: 'POST', body: '{}' }) }
 export async function getPhotoProviders() { return api<PhotoProviderInfo>('/admin/photos/providers') }
 export async function updateItinerary(id: number, body: Record<string, unknown>) { return api<Itinerary>(`/itineraries/${id}`, { method: 'PUT', body: JSON.stringify(body) }) }
-export async function replanItinerary(id: number, instruction: string) { return api<Itinerary>(`/itineraries/${id}/replan`, { method: 'POST', body: JSON.stringify({ instruction }) }) }
+export type ReplanAction = { type: 'set_budget' | 'set_days' | 'set_preferences' | 'remove_attraction' | 'replace_attraction'; value?: number | null; attraction_id?: number | null; new_attraction_id?: number | null; preferences?: string[] | null }
+export type ReplanPreview = { status: 'ready' | 'needs_clarification'; summary: string; actions: ReplanAction[]; questions: string[]; parser: 'llm' | 'local' }
+export async function previewReplanItinerary(id: number, instruction: string) { return api<ReplanPreview>(`/itineraries/${id}/replan/preview`, { method: 'POST', body: JSON.stringify({ instruction }) }) }
+export async function replanItinerary(id: number, instruction: string, actions: ReplanAction[]) { return api<Itinerary>(`/itineraries/${id}/replan`, { method: 'POST', body: JSON.stringify({ instruction, actions }) }) }
 export async function getItineraryRevisions(id: number) { return api<{ id: number; version_no: number; reason: string; created_at: string }[]>(`/itineraries/${id}/revisions`) }
 export async function restoreItineraryRevision(id: number, version: number) { return api<Itinerary>(`/itineraries/${id}/revisions/${version}/restore`, { method: 'POST', body: '{}' }) }
 export async function createShare(id: number, expires_days = 30) { return api<{ id: number; share_url: string; expires_at: string }>(`/itineraries/${id}/shares`, { method: 'POST', body: JSON.stringify({ expires_days }) }) }
+export type ShareHistoryItem = { id: number; itinerary_id: number; itinerary_title: string; city_name: string; status: 'active' | 'expired' | 'revoked'; expires_at: string; revoked_at: string | null; created_at: string }
+export async function getMyShares() { return api<ShareHistoryItem[]>('/shares') }
+export async function revokeShare(itineraryId: number, shareId: number) { return api(`/itineraries/${itineraryId}/shares/${shareId}`, { method: 'DELETE' }) }
 export async function saveFeedback(id: number, rating: number, comment: string) { return api(`/itineraries/${id}/feedback`, { method: 'PUT', body: JSON.stringify({ rating, comment }) }) }
 export async function getFeedback(id: number) { return api<{ rating: number | null; comment: string; average: number | null; count: number; status: 'open' | 'in_progress' | 'resolved' | null; admin_reply: string | null; replied_at: string | null }>(`/itineraries/${id}/feedback`) }
 export type AdminFeedback = { id: number; itinerary_id: number; username: string; email: string; city_name: string; itinerary_title: string; rating: number; comment: string; status: 'open' | 'in_progress' | 'resolved'; assigned_admin_id: number | null; assigned_admin_username: string | null; admin_reply: string | null; replied_at: string | null; handled_at: string | null; created_at: string; updated_at: string }

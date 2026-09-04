@@ -83,6 +83,17 @@ def test_user_content_profile_itinerary_share_and_feedback():
         assert share.status_code == 200
         token = re.search(r"/share/itineraries/([^/]+)$", share.json()["share_url"]).group(1)
         assert client.get(f"/api/v1/shares/{token}").json()["title"] == "成都摄影周末"
+        history = client.get("/api/v1/shares")
+        assert history.status_code == 200
+        assert history.json() == [{
+            "id": share.json()["id"], "itinerary_id": itinerary_id, "itinerary_title": "成都摄影周末", "city_name": city["name"],
+            "status": "active", "expires_at": share.json()["expires_at"], "revoked_at": None, "created_at": share.json()["created_at"],
+        }]
+        assert "share_url" not in history.json()[0]
+        assert "token" not in history.json()[0]
+        assert client.delete(f"/api/v1/itineraries/{itinerary_id}/shares/{share.json()['id']}", headers=headers).status_code == 204
+        assert client.get("/api/v1/shares").json()[0]["status"] == "revoked"
+        assert client.get(f"/api/v1/shares/{token}").status_code == 404
 
 
 def test_itinerary_favorites_require_ownership_and_draft_cannot_be_shared():

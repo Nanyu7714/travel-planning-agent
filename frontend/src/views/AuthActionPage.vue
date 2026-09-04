@@ -15,7 +15,6 @@ const loading = ref(false)
 const message = ref('')
 const error = ref('')
 const devActionUrl = ref('')
-const devVerificationCode = ref('')
 const retrySeconds = ref(0)
 const verificationComplete = ref(false)
 let retryTimer: number | undefined
@@ -26,7 +25,7 @@ const isVerificationForm = computed(() => mode.value === 'auth-verify' || mode.v
 
 function startRetryCountdown(seconds: number) {
   if (retryTimer !== undefined) window.clearInterval(retryTimer)
-  retrySeconds.value = Math.max(0, seconds)
+  retrySeconds.value = Math.min(60, Math.max(0, seconds))
   if (!retrySeconds.value) return
   retryTimer = window.setInterval(() => {
     retrySeconds.value = Math.max(0, retrySeconds.value - 1)
@@ -35,13 +34,12 @@ function startRetryCountdown(seconds: number) {
 }
 
 async function sendCode() {
-  error.value = ''; message.value = ''; devVerificationCode.value = ''
+  error.value = ''; message.value = ''
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.value.trim())) { error.value = '请输入有效的邮箱地址'; return }
   loading.value = true
   try {
     const result = await sendVerificationCode(email.value.trim())
     message.value = result.message
-    devVerificationCode.value = result.dev_verification_code || ''
     startRetryCountdown(result.retry_after_seconds || 0)
   } catch (exception) {
     error.value = exception instanceof Error ? exception.message : '验证码发送失败'
@@ -133,7 +131,6 @@ onBeforeUnmount(() => {
         <button class="secondary-button send-code-button" type="button" :disabled="loading || retrySeconds > 0" @click="sendCode"><Send :size="16" />{{ retrySeconds > 0 ? `${retrySeconds} 秒` : '发送验证码' }}</button>
       </div>
       <p v-if="message" class="form-notice">{{ message }}</p>
-      <p v-if="devVerificationCode" class="form-notice">本地测试验证码：{{ devVerificationCode }}</p>
       <p v-if="error" class="form-error">{{ error }}</p>
       <button class="primary-button" :disabled="loading">{{ loading ? '正在处理...' : '验证邮箱' }}</button>
     </form>

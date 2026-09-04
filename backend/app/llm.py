@@ -62,7 +62,7 @@ def _failure_reason(exc: Exception) -> str:
     return type(exc).__name__
 
 
-def _call_model(system_prompt: str, messages: list[dict], max_tokens: int | None = None) -> str | None:
+def _call_model(system_prompt: str, messages: list[dict], max_tokens: int | None = None, temperature: float = 0.5) -> str | None:
     if not settings.llm_api_key:
         _set_status("disabled")
         return None
@@ -76,7 +76,7 @@ def _call_model(system_prompt: str, messages: list[dict], max_tokens: int | None
                 json={
                     "model": settings.llm_model,
                     "messages": request_messages,
-                    "temperature": 0.5,
+                    "temperature": temperature,
                     "max_tokens": max_tokens or settings.llm_max_tokens,
                 },
             )
@@ -112,3 +112,32 @@ def generate_itinerary_summary(requirement: dict, itinerary: dict) -> str | None
     )
     content = json.dumps({"requirement": requirement, "itinerary": itinerary}, ensure_ascii=False)
     return _call_model(system_prompt, [{"role": "user", "content": content}], max_tokens=300)
+
+
+def generate_replan_interpretation(instruction: str, itinerary: dict, attractions: list[dict]) -> dict | None:
+    """Ask an optional LLM for a JSON proposal; callers must still validate every action."""
+    system_prompt = (
+        "你是行程修改意图解析器，只输出一个 JSON 对象，不能输出 Markdown 或解释。"
+        "JSON 格式固定为："
+        '{"status":"ready"|"needs_clarification","summary":"简短中文说明","actions":[...],"questions":[...]}. '
+        "actions 只能使用 set_days(value 1-10)、set_budget(value 0-100000)、"
+        "set_preferences(preferences 字符串数组)、remove_attraction(attraction_id)、"
+        "replace_attraction(attraction_id,new_attraction_id)。景点 ID 必须来自给定数据。"
+        "用户意图不完整、景点名称有歧义、想改动当前不支持的内容，必须返回 needs_clarification，"
+        "actions 为空，并提出最多三个具体问题。不得编造景点、价格、路线或 ID。"
+    )
+    payload = json.dumps(
+        {"instruction": instruction, "itinerary": itinerary, "available_attractions": attractions},
+        ensure_ascii=False,
+    )
+    content = _call_model(system_prompt, [{"role": "user", "content": payload}], max_tokens=500, temperature=0)
+    if not content:
+        return None
+    try:
+        normalized = content.strip()
+        if normalized.startswith("```"):
+            normalized = normalized.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        parsed = json.loads(normalized)
+        return parsed if isinstance(parsed, dict) else None
+    except (json.JSONDecodeError, IndexError, TypeError):
+        return None

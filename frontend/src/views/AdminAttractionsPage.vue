@@ -7,7 +7,7 @@ import { api } from '../api'
 
 type City = { id: number; name: string }
 type AttractionRow = { id: number; city_id: number; city_name: string; name: string; description: string; tags: string[]; opening_hours: string; ticket_price: number; duration_minutes: number; area: string; latitude: number | null; longitude: number | null; image_url: string; source: string; is_active: boolean }
-type AttractionForm = Omit<AttractionRow, 'id' | 'city_name' | 'tags'> & { tags: string; latitude: string; longitude: string }
+type AttractionForm = Omit<AttractionRow, 'id' | 'city_name' | 'tags' | 'latitude' | 'longitude'> & { tags: string; latitude: string; longitude: string }
 const emptyForm = (cityId = 0): AttractionForm => ({ city_id: cityId, name: '', description: '', tags: '', opening_hours: '全天开放', ticket_price: 0, duration_minutes: 120, area: '', latitude: '', longitude: '', image_url: '', source: '管理员维护', is_active: true })
 const route = useRoute(); const cities = ref<City[]>([]); const attractions = ref<AttractionRow[]>([]); const cityFilter = ref(Number(route.query.city) || 0); const search = ref(''); const error = ref(''); const notice = ref(''); const editingId = ref<number | null>(null); const form = ref<AttractionForm>(emptyForm(cityFilter.value)); const showImport = ref(false); const saving = ref(false)
 const importText = ref('[\n  {\n    "city_id": 1,\n    "name": "示例景点",\n    "description": "景点介绍",\n    "tags": ["文化"],\n    "opening_hours": "09:00-17:00",\n    "ticket_price": 0,\n    "duration_minutes": 120,\n    "area": "城区"\n  }\n]')

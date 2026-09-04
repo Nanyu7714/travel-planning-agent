@@ -13,6 +13,8 @@ AMAP_DIRECTION_URLS = {
     "public_transport": "https://restapi.amap.com/v5/direction/transit/integrated",
 }
 AMAP_GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
+AMAP_WEATHER_URL = "https://restapi.amap.com/v3/weather/weatherInfo"
+AMAP_NEARBY_PLACE_URL = "https://restapi.amap.com/v3/place/around"
 
 
 def format_coordinate(latitude: float, longitude: float) -> str:
@@ -61,6 +63,81 @@ def request_amap_geocode(address: str) -> dict | None:
     if not coordinate:
         return None
     return {"coordinate": coordinate, "citycode": geocode.get("citycode")}
+
+
+def request_amap_weather(city_code: str | None, travel_date: date | None) -> dict:
+    """Return the available forecast for the planned date without fabricating weather data."""
+    if not travel_date:
+        return {"status": "unknown", "reason": "未填写出行日期"}
+    if not settings.amap_web_service_key or not city_code:
+        return {"status": "unknown", "reason": "高德天气服务未配置或城市编码不可用", "date": travel_date.isoformat()}
+    try:
+        response = httpx.get(
+            AMAP_WEATHER_URL,
+            params={"key": settings.amap_web_service_key, "city": city_code, "extensions": "all"},
+            timeout=12,
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return {"status": "unknown", "reason": "高德天气服务暂时不可用", "date": travel_date.isoformat()}
+    forecasts = payload.get("forecasts") or []
+    casts = forecasts[0].get("casts") if forecasts else []
+    matched = next((item for item in casts or [] if item.get("date") == travel_date.isoformat()), None)
+    if not matched:
+        return {"status": "unknown", "reason": "计划日期不在天气预报范围内", "date": travel_date.isoformat()}
+    return {
+        "status": "passed",
+        "provider": "高德天气",
+        "date": travel_date.isoformat(),
+        "day_weather": matched.get("dayweather"),
+        "night_weather": matched.get("nightweather"),
+        "day_temp": matched.get("daytemp"),
+        "night_temp": matched.get("nighttemp"),
+        "day_wind": matched.get("daywind"),
+        "day_power": matched.get("daypower"),
+    }
+
+
+def request_amap_nearby_food(coordinate: tuple[float, float], city: str, limit: int = 2) -> list[dict]:
+    """Find traceable nearby food POIs for a planned stop."""
+    if not settings.amap_web_service_key:
+        return []
+    try:
+        response = httpx.get(
+            AMAP_NEARBY_PLACE_URL,
+            params={
+                "key": settings.amap_web_service_key,
+                "location": format_coordinate(*coordinate),
+                "types": "餐饮服务",
+                "city": city,
+                "radius": "1500",
+                "sortrule": "distance",
+                "offset": str(max(1, min(limit, 10))),
+                "page": "1",
+                "extensions": "all",
+            },
+            timeout=12,
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return []
+    if payload.get("status") != "1":
+        return []
+    return [
+        {
+            "name": item.get("name"),
+            "address": item.get("address"),
+            "distance_meters": int(_number(item.get("distance"))),
+            "type": item.get("type"),
+            "rating": (item.get("biz_ext") or {}).get("rating"),
+        }
+        for item in (payload.get("pois") or [])[:limit]
+        if item.get("name")
+    ]
 
 
 def request_amap_route(

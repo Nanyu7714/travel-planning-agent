@@ -99,7 +99,7 @@ onBeforeUnmount(() => { window.removeEventListener('auth-expired', handleAuthExp
         <RouterLink v-if="account?.role === 'admin'" to="/admin" @click="menuOpen = false">管理后台</RouterLink>
       </nav>
       <div class="nav-actions">
-        <div v-if="account" class="profile-menu-wrap"><button class="account-name" title="打开用户菜单" :aria-expanded="profileMenuOpen" @click="profileMenuOpen = !profileMenuOpen"><UserRound :size="16" /><span>{{ account.username }}</span></button><div v-if="profileMenuOpen" class="profile-menu" role="menu"><RouterLink to="/me" role="menuitem" @click="profileMenuOpen = false">用户主页</RouterLink><RouterLink to="/community?mine=1" role="menuitem" @click="profileMenuOpen = false">我的发布</RouterLink><RouterLink to="/me/settings/security" role="menuitem" @click="profileMenuOpen = false">账号安全</RouterLink><button role="menuitem" @click="logout">退出登录</button></div></div>
+        <div v-if="account" class="profile-menu-wrap"><button class="account-name" title="打开用户菜单" :aria-expanded="profileMenuOpen" @click="profileMenuOpen = !profileMenuOpen"><UserRound :size="16" /><span>{{ account.username }}</span></button><div v-if="profileMenuOpen" class="profile-menu" role="menu"><RouterLink to="/me" role="menuitem" @click="profileMenuOpen = false">用户主页</RouterLink><RouterLink to="/me/shares" role="menuitem" @click="profileMenuOpen = false">我的分享</RouterLink><RouterLink to="/community?mine=1" role="menuitem" @click="profileMenuOpen = false">我的发布</RouterLink><RouterLink to="/me/settings/security" role="menuitem" @click="profileMenuOpen = false">账号安全</RouterLink><button role="menuitem" @click="logout">退出登录</button></div></div>
         <button v-else-if="authReady" class="login-button" @click="loginOpen = true"><LogIn :size="16" />登录</button>
         <span v-else class="auth-action-placeholder" aria-hidden="true"></span>
         <button class="menu-button" aria-label="打开菜单" @click="menuOpen = !menuOpen"><X v-if="menuOpen" :size="20" /><Menu v-else :size="20" /></button>
@@ -165,5 +165,33 @@ onBeforeUnmount(() => { window.removeEventListener('auth-expired', handleAuthExp
 .auth-dev-link { color: var(--color-primary); font-size: 13px; text-decoration: underline; }
 .auth-help-links { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
 .auth-help-links a { color: var(--color-muted); }
-@media (max-width: 744px) { .profile-menu-wrap > .account-name { width: 40px; padding: 0; justify-content: center; } .profile-menu-wrap > .account-name span { display: none; } .profile-menu { top: 48px; } .auth-modal { padding: 24px; } }
+@media (max-width: 744px) {
+  .profile-menu-wrap > .account-name { width: 40px; padding: 0; justify-content: center; }
+  .profile-menu-wrap > .account-name span { display: none; }
+  .profile-menu { top: 48px; }
+  .modal-backdrop { display: flex; align-items: flex-end; padding: 0; }
+  .auth-modal {
+    position: relative;
+    top: auto;
+    right: auto;
+    left: auto;
+    width: 100%;
+    max-height: min(82svh, 680px);
+    padding: 22px 20px calc(24px + env(safe-area-inset-bottom));
+    overflow-y: auto;
+    border-radius: 20px 20px 0 0;
+    box-shadow: 0 -8px 28px rgba(0, 0, 0, 0.16);
+    transform: none;
+    animation: auth-sheet-enter 220ms ease-out;
+  }
+  .auth-modal__header h2 { font-size: 21px; }
+  .auth-tabs { margin: 20px 0; }
+  .auth-modal form { gap: 14px; }
+  .auth-modal form input { min-height: 52px; }
+  .auth-help-links { gap: 8px; }
+}
+
+@keyframes auth-sheet-enter { from { transform: translateY(28px); } to { transform: translateY(0); } }
+
+@media (prefers-reduced-motion: reduce) { .auth-modal { animation: none; } }
 </style>

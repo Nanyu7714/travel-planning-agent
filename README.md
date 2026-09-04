@@ -36,6 +36,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
+alembic upgrade head
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -47,7 +48,7 @@ npm install
 npm run dev
 ```
 
-打开 `http://localhost:5173`。本地默认使用 SQLite（数据库文件位于仓库根目录），首次启动会自动创建表和示例数据。
+打开 `http://localhost:5173`。本地默认使用 SQLite（数据库文件位于仓库根目录）；`alembic upgrade head` 负责创建或升级表，应用首次启动只写入示例数据。
 
 管理员账号由部署人员在服务端初始化和管理，不在前端或项目文档中公开凭据。
 
@@ -76,6 +77,8 @@ DATABASE_URL=postgresql+psycopg://travel_user:密码@127.0.0.1:5432/travel_platf
 ```
 
 大模型 Key、数据库密码、JWT 密钥和高德 Web Service Key 只能放在后端环境变量中，`.env` 不能提交到 Git。正式部署前必须修改 `JWT_SECRET`、`CSRF_SECRET` 和管理员密码。
+
+每次部署代码前，在 `backend` 目录执行 `alembic upgrade head`，再重启 Web 服务和规划 Worker。对于此前由旧版应用自动建表的数据库，应先完成备份，再执行 `alembic stamp head` 和 `alembic check`；两条命令均确认无误后才按后续版本升级。回退一个迁移版本使用 `alembic downgrade -1`。
 
 大模型使用兼容 OpenAI Chat Completions 的后端接口。项目不会自动创建或修改 `.env`，请根据所使用的服务填写：
 
@@ -126,7 +129,7 @@ Vue 构建结果放入 `/www/wwwroot/travel-web/`，FastAPI 项目放入 `/www/w
 4. 完成 Agent Worker、SSE、推荐评分、路线规划和约束校验。
 5. 完成用户端、后台、自动化测试、数据导入与部署演练。
 
-当前已实现城市/景点详情、城市内热度排行、行程工作台编辑与版本、只读分享、收藏/最近浏览、用户主页、邮箱验证、密码找回、账号设备管理和反馈收件箱；真实图片、地图、实时热点和正式 PostgreSQL 迁移仍见 [未实现功能清单](docs/未实现功能.md)。
+当前已实现城市/景点详情、城市内热度排行、行程工作台编辑与版本、只读分享、收藏/最近浏览、用户主页、邮箱验证、密码找回、账号设备管理、反馈收件箱和 Alembic 数据库迁移；真实图片、地图和实时热点仍见 [未实现功能清单](docs/未实现功能.md)。
 
 ## 仓库地址
 
