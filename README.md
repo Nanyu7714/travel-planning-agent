@@ -110,6 +110,12 @@ npm run build
 
 Vue 构建结果放入 `/www/wwwroot/travel-web/`，FastAPI 项目放入 `/www/wwwroot/travel-api/`。生产环境使用一个 Uvicorn Worker 和一个规划 Worker，由 Nginx 转发 `/api/` 到 `127.0.0.1:8000`，SSE 路由关闭代理缓冲，并配置 HTTPS、每日 PostgreSQL 备份和健康检查。
 
+### 自动部署
+
+仓库的 `.github/workflows/deploy-production.yml` 只会在 `main` 分支推送或手动触发时运行。它要求服务器安装带有 `self-hosted`、`linux` 和 `travel-production` 标签的 GitHub Actions Runner，并只调用服务器本机的 `/usr/local/sbin/travel-planning-deploy` 固定脚本。该脚本应先确认线上工作目录无未提交改动，再拉取 `main`、执行 `backend/.venv/bin/alembic upgrade head`、构建前端并重启 `travel-planning-agent` 服务。不要在仓库、工作流或 GitHub Secrets 中保存应用 `.env`、数据库密码、部署密钥或服务器 SSH 私钥。
+
+自托管 Runner 等同于一把受限的“部署钥匙”：只有仓库管理员可以向 `main` 推送，并且 Runner 用户只应被授予执行该固定脚本的 `sudo` 权限。接入 Runner 前，先在 GitHub 仓库的 `Settings -> Actions -> Runners` 生成一次性注册链接；该链接和令牌不应发送到仓库或聊天记录中。
+
 ## 项目文档
 
 - [开发文档](旅游规划咨询Agent-开发文档.md)

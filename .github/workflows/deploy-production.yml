@@ -1,0 +1,27 @@
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy server application
+    runs-on:
+      - self-hosted
+      - linux
+      - travel-production
+    timeout-minutes: 15
+
+    steps:
+      - name: Run guarded deployment script
+        run: sudo /usr/local/sbin/travel-planning-deploy
